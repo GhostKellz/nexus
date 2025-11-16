@@ -1,0 +1,7 @@
+.zig-cache/
+zig-out/
+*.o
+*.exe
+CLAUDE.md
+TODO.md
+DEVELOPMENT_ROADMAP.md
