@@ -152,29 +152,86 @@ pub const Response = struct {
 
     pub fn send(self: *Response, data: []const u8) !void {
         if (self.sent) return error.AlreadySent;
-        // TODO: Implement with proper Zig 0.16 I/O
-        _ = data;
+
+        // Set Content-Length if not set
+        if (self.headers.get("Content-Length") == null) {
+            const len_str = try std.fmt.allocPrint(self.allocator, "{d}", .{data.len});
+            defer self.allocator.free(len_str);
+            try self.headers.set("Content-Length", len_str);
+        }
+
+        // Build response header
+        var header_buf: std.ArrayList(u8) = .{};
+        defer header_buf.deinit(self.allocator);
+
+        // Status line
+        try header_buf.appendSlice(self.allocator, "HTTP/1.1 ");
+        const status_code_str = try std.fmt.allocPrint(self.allocator, "{d}", .{self.status_code.toInt()});
+        defer self.allocator.free(status_code_str);
+        try header_buf.appendSlice(self.allocator, status_code_str);
+        try header_buf.appendSlice(self.allocator, " ");
+        try header_buf.appendSlice(self.allocator, self.status_code.toString());
+        try header_buf.appendSlice(self.allocator, "\r\n");
+
+        // Headers
+        var it = self.headers.map.iterator();
+        while (it.next()) |entry| {
+            try header_buf.appendSlice(self.allocator, entry.key_ptr.*);
+            try header_buf.appendSlice(self.allocator, ": ");
+            try header_buf.appendSlice(self.allocator, entry.value_ptr.*);
+            try header_buf.appendSlice(self.allocator, "\r\n");
+        }
+
+        // End headers
+        try header_buf.appendSlice(self.allocator, "\r\n");
+
+        // Write header and body using netWrite
+        // We need the Io object - get it from TcpConnection
+        // For now, write directly using posix (we'll improve this)
+        const header_slice = header_buf.items;
+
+        // Write header
+        _ = try std.posix.write(self.stream.socket.handle, header_slice);
+
+        // Write body if present
+        if (data.len > 0) {
+            _ = try std.posix.write(self.stream.socket.handle, data);
+        }
+
         self.sent = true;
-        return error.NotImplemented;
     }
 
     pub fn json(self: *Response, value: anytype) !void {
         _ = try self.setHeader("Content-Type", "application/json");
-        // TODO: Use new JSON API
-        _ = value;
-        return error.NotImplemented;
+
+        // Use std.json.Stringify with Io.Writer
+        var json_buf: std.ArrayList(u8) = .{};
+        defer json_buf.deinit(self.allocator);
+
+        // Create Io.Writer
+        var writer_impl: std.Io.Writer.Allocating = .init(self.allocator);
+        defer writer_impl.deinit();
+
+        // Create Stringify instance
+        var stringify: std.json.Stringify = .{
+            .writer = &writer_impl.writer,
+        };
+
+        // Write the value
+        try stringify.write(value);
+
+        // Get written data
+        try self.send(writer_impl.written());
     }
 
     pub fn html(self: *Response, data: []const u8) !void {
         _ = try self.setHeader("Content-Type", "text/html; charset=utf-8");
-        _ = data;
-        return error.NotImplemented;
+        try self.send(data);
     }
 
     pub fn text(self: *Response, data: []const u8) !void {
         _ = try self.setHeader("Content-Type", "text/plain; charset=utf-8");
-        _ = data;
-        return error.NotImplemented;
+        try self.send(data);
     }
 };
 
