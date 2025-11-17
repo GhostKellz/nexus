@@ -1,4 +1,5 @@
 const std = @import("std");
+const interpreter = @import("interpreter.zig");
 
 /// WASM value types
 pub const ValueType = enum {
@@ -219,7 +220,19 @@ pub const Instance = struct {
 
         return switch (func.code) {
             .host => |host_fn| try host_fn(params, self.allocator),
-            .wasm => error.NotImplemented, // WASM execution not yet implemented
+            .wasm => |bytecode| {
+                // Create interpreter with locals = params.len + extra locals
+                var interp = try interpreter.Interpreter.init(self.allocator, self, params.len);
+                defer interp.deinit();
+
+                // Initialize parameters as locals
+                for (params, 0..) |param, i| {
+                    try interp.locals.set(@intCast(i), param);
+                }
+
+                // Execute bytecode
+                return try interp.execute(bytecode);
+            },
         };
     }
 
@@ -238,6 +251,27 @@ pub const Instance = struct {
             .param_types = try self.allocator.dupe(ValueType, param_types),
             .return_types = try self.allocator.dupe(ValueType, return_types),
             .code = .{ .host = host_fn },
+            .allocator = self.allocator,
+        };
+
+        try self.functions.put(name, func);
+    }
+
+    pub fn registerWasmFunction(
+        self: *Instance,
+        name: []const u8,
+        param_types: []const ValueType,
+        return_types: []const ValueType,
+        bytecode: []const u8,
+    ) !void {
+        const func = try self.allocator.create(Function);
+        errdefer self.allocator.destroy(func);
+
+        func.* = Function{
+            .name = try self.allocator.dupe(u8, name),
+            .param_types = try self.allocator.dupe(ValueType, param_types),
+            .return_types = try self.allocator.dupe(ValueType, return_types),
+            .code = .{ .wasm = try self.allocator.dupe(u8, bytecode) },
             .allocator = self.allocator,
         };
 

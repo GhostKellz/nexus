@@ -1,6 +1,7 @@
 const std = @import("std");
 const tcp = @import("tcp.zig");
 const http_parser = @import("http_parser.zig");
+const websocket = @import("websocket.zig");
 
 pub const Method = enum {
     GET,
@@ -77,10 +78,19 @@ pub const Request = struct {
     body: []const u8,
     allocator: std.mem.Allocator,
     parsed: http_parser.RequestParser.ParsedRequest,
+    cookies: std.StringHashMap([]const u8),
 
     pub fn deinit(self: *Request) void {
         self.headers.deinit();
         self.parsed.deinit();
+
+        // Free cookie map
+        var it = self.cookies.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.cookies.deinit();
     }
 
     pub fn readBody(self: *Request) ![]const u8 {
@@ -93,6 +103,11 @@ pub const Request = struct {
 
     pub fn getQuery(self: *Request, key: []const u8) ?[]const u8 {
         return self.parsed.getQuery(key);
+    }
+
+    /// Get a cookie value by name
+    pub fn getCookie(self: *Request, name: []const u8) ?[]const u8 {
+        return self.cookies.get(name);
     }
 
     /// Parse JSON body into a type
@@ -128,6 +143,15 @@ pub const StatusCode = enum(u16) {
             .InternalServerError => "Internal Server Error",
         };
     }
+};
+
+pub const CookieOptions = struct {
+    max_age: ?i64 = null, // seconds
+    path: ?[]const u8 = null,
+    domain: ?[]const u8 = null,
+    secure: bool = false,
+    http_only: bool = false,
+    same_site: ?[]const u8 = null, // "Strict", "Lax", "None"
 };
 
 pub const Response = struct {
@@ -243,6 +267,120 @@ pub const Response = struct {
     pub fn text(self: *Response, data: []const u8) !void {
         _ = try self.setHeader("Content-Type", "text/plain; charset=utf-8");
         try self.send(data);
+    }
+
+    /// Set a cookie with optional parameters
+    pub fn setCookie(self: *Response, name: []const u8, value: []const u8, options: CookieOptions) !*Response {
+        var cookie_value: std.ArrayList(u8) = .{};
+        defer cookie_value.deinit(self.allocator);
+
+        // name=value
+        try cookie_value.appendSlice(self.allocator, name);
+        try cookie_value.append(self.allocator, '=');
+        try cookie_value.appendSlice(self.allocator, value);
+
+        // Max-Age
+        if (options.max_age) |max_age| {
+            try cookie_value.appendSlice(self.allocator, "; Max-Age=");
+            const age_str = try std.fmt.allocPrint(self.allocator, "{d}", .{max_age});
+            defer self.allocator.free(age_str);
+            try cookie_value.appendSlice(self.allocator, age_str);
+        }
+
+        // Path
+        if (options.path) |path| {
+            try cookie_value.appendSlice(self.allocator, "; Path=");
+            try cookie_value.appendSlice(self.allocator, path);
+        }
+
+        // Domain
+        if (options.domain) |domain| {
+            try cookie_value.appendSlice(self.allocator, "; Domain=");
+            try cookie_value.appendSlice(self.allocator, domain);
+        }
+
+        // Secure
+        if (options.secure) {
+            try cookie_value.appendSlice(self.allocator, "; Secure");
+        }
+
+        // HttpOnly
+        if (options.http_only) {
+            try cookie_value.appendSlice(self.allocator, "; HttpOnly");
+        }
+
+        // SameSite
+        if (options.same_site) |same_site| {
+            try cookie_value.appendSlice(self.allocator, "; SameSite=");
+            try cookie_value.appendSlice(self.allocator, same_site);
+        }
+
+        // Set the Set-Cookie header
+        const cookie_str = try self.allocator.dupe(u8, cookie_value.items);
+        defer self.allocator.free(cookie_str);
+        try self.headers.set("Set-Cookie", cookie_str);
+
+        return self;
+    }
+
+    /// Upgrade connection to WebSocket
+    pub fn upgradeWebSocket(self: *Response, req: *Request) !*websocket.WebSocket {
+        if (self.sent) return error.AlreadySent;
+
+        // Validate WebSocket upgrade headers
+        const upgrade_header = req.getHeader("upgrade") orelse return error.MissingUpgradeHeader;
+        _ = req.getHeader("connection") orelse return error.MissingConnectionHeader;
+        const ws_key = req.getHeader("sec-websocket-key") orelse return error.MissingWebSocketKey;
+
+        // Check for "websocket" in upgrade header (case insensitive)
+        var upgrade_lower: [32]u8 = undefined;
+        const upgrade_normalized = std.ascii.lowerString(&upgrade_lower, upgrade_header);
+        if (std.mem.indexOf(u8, upgrade_normalized, "websocket") == null) {
+            return error.InvalidUpgradeHeader;
+        }
+
+        // Generate WebSocket accept key
+        const magic_string = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+        const combined = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ ws_key, magic_string });
+        defer self.allocator.free(combined);
+
+        var hasher = std.crypto.hash.Sha1.init(.{});
+        hasher.update(combined);
+        var hash: [20]u8 = undefined;
+        hasher.final(&hash);
+
+        // Base64 encode
+        const encoder = std.base64.standard.Encoder;
+        var encoded: [28]u8 = undefined;
+        const accept_key = encoder.encode(&encoded, &hash);
+
+        // Send 101 Switching Protocols response
+        var header_buf: std.ArrayList(u8) = .{};
+        defer header_buf.deinit(self.allocator);
+
+        try header_buf.appendSlice(self.allocator, "HTTP/1.1 101 Switching Protocols\r\n");
+        try header_buf.appendSlice(self.allocator, "Upgrade: websocket\r\n");
+        try header_buf.appendSlice(self.allocator, "Connection: Upgrade\r\n");
+        try header_buf.appendSlice(self.allocator, "Sec-WebSocket-Accept: ");
+        try header_buf.appendSlice(self.allocator, accept_key);
+        try header_buf.appendSlice(self.allocator, "\r\n\r\n");
+
+        // Write handshake response
+        _ = try std.posix.write(self.stream.socket.handle, header_buf.items);
+
+        self.sent = true;
+
+        // Generate unique ID
+        const id = try std.fmt.allocPrint(self.allocator, "ws_{d}", .{std.crypto.random.int(u64)});
+        defer self.allocator.free(id);
+
+        // Convert std.Io.net.Stream to std.net.Stream
+        const net_stream = std.net.Stream{ .handle = self.stream.socket.handle };
+
+        // Create and return WebSocket
+        const ws = try self.allocator.create(websocket.WebSocket);
+        ws.* = try websocket.WebSocket.init(self.allocator, net_stream, id);
+        return ws;
     }
 };
 
@@ -385,6 +523,12 @@ pub const Server = struct {
         // Create headers (already in parsed.headers)
         const headers = Headers.init(allocator);
 
+        // Parse cookies from Cookie header
+        var cookies = std.StringHashMap([]const u8).init(allocator);
+        if (parsed.getHeader("cookie")) |cookie_header| {
+            try parseCookies(allocator, cookie_header, &cookies);
+        }
+
         return Request{
             .method = method,
             .path = parsed.path,
@@ -393,7 +537,28 @@ pub const Server = struct {
             .body = parsed.body,
             .allocator = allocator,
             .parsed = parsed,
+            .cookies = cookies,
         };
+    }
+
+    fn parseCookies(allocator: std.mem.Allocator, cookie_header: []const u8, cookies: *std.StringHashMap([]const u8)) !void {
+        var iter = std.mem.splitScalar(u8, cookie_header, ';');
+        while (iter.next()) |pair| {
+            const trimmed = std.mem.trim(u8, pair, " \t");
+            if (trimmed.len == 0) continue;
+
+            if (std.mem.indexOfScalar(u8, trimmed, '=')) |eq_pos| {
+                const name = trimmed[0..eq_pos];
+                const value = trimmed[eq_pos + 1 ..];
+
+                const name_duped = try allocator.dupe(u8, name);
+                errdefer allocator.free(name_duped);
+                const value_duped = try allocator.dupe(u8, value);
+                errdefer allocator.free(value_duped);
+
+                try cookies.put(name_duped, value_duped);
+            }
+        }
     }
 };
 

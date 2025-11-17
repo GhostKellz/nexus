@@ -22,7 +22,10 @@ pub fn main() !void {
 
     const command = args[1];
 
-    if (std.mem.eql(u8, command, "run")) {
+    if (std.mem.eql(u8, command, "init")) {
+        const project_name = if (args.len >= 3) args[2] else "my-nexus-app";
+        try initProject(allocator, project_name);
+    } else if (std.mem.eql(u8, command, "run")) {
         if (args.len < 3) {
             nexus.console.@"error"("Usage: nexus run <file.zig>", .{});
             return error.MissingArgument;
@@ -34,6 +37,19 @@ pub fn main() !void {
         // For now, just acknowledge the command
         nexus.console.info("✓ File execution not yet implemented", .{});
         nexus.console.info("  This will compile and run Zig files with Nexus runtime", .{});
+    } else if (std.mem.eql(u8, command, "dev")) {
+        const port: u16 = if (args.len >= 3) blk: {
+            break :blk std.fmt.parseInt(u16, args[2], 10) catch 3000;
+        } else 3000;
+        try runDevServer(allocator, port);
+    } else if (std.mem.eql(u8, command, "build")) {
+        const release = for (args) |arg| {
+            if (std.mem.eql(u8, arg, "--release")) break true;
+        } else false;
+        try buildProject(allocator, release);
+    } else if (std.mem.eql(u8, command, "deploy")) {
+        const target = if (args.len >= 3) args[2] else "production";
+        try deployProject(allocator, target);
     } else if (std.mem.eql(u8, command, "serve")) {
         try runHttpServer(allocator);
     } else if (std.mem.eql(u8, command, "test")) {
@@ -55,15 +71,22 @@ fn printUsage() void {
     nexus.console.println("Usage: nexus <command> [options]", .{});
     nexus.console.println("", .{});
     nexus.console.println("Commands:", .{});
-    nexus.console.println("  run <file>     Run a Zig file with Nexus runtime", .{});
-    nexus.console.println("  serve          Start a demo HTTP server", .{});
-    nexus.console.println("  test           Run tests", .{});
-    nexus.console.println("  version        Print version information", .{});
-    nexus.console.println("  help           Print this help message", .{});
+    nexus.console.println("  init [name]         Create a new Nexus project", .{});
+    nexus.console.println("  dev [port]          Start development server with hot reload", .{});
+    nexus.console.println("  build [--release]   Build project for production", .{});
+    nexus.console.println("  deploy [target]     Deploy to production", .{});
+    nexus.console.println("  run <file>          Run a Zig file with Nexus runtime", .{});
+    nexus.console.println("  serve               Start a demo HTTP server", .{});
+    nexus.console.println("  test                Run tests", .{});
+    nexus.console.println("  version             Print version information", .{});
+    nexus.console.println("  help                Print this help message", .{});
     nexus.console.println("", .{});
     nexus.console.println("Examples:", .{});
-    nexus.console.println("  nexus run app.zig", .{});
-    nexus.console.println("  nexus serve", .{});
+    nexus.console.println("  nexus init my-app      # Create new project", .{});
+    nexus.console.println("  nexus dev --port 8080  # Dev server on port 8080", .{});
+    nexus.console.println("  nexus build --release  # Production build", .{});
+    nexus.console.println("  nexus deploy aws       # Deploy to AWS", .{});
+    nexus.console.println("  nexus run app.zig      # Run a file", .{});
     nexus.console.println("", .{});
 }
 
@@ -261,4 +284,255 @@ fn handleStatus(req: *nexus.http.Request, res: *nexus.http.Response) !void {
             .target_memory_mb = 5,
         },
     });
+}
+
+/// Initialize a new Nexus project
+fn initProject(allocator: std.mem.Allocator, name: []const u8) !void {
+    nexus.console.info("🚀 Creating new Nexus project: {s}", .{name});
+
+    // Create project directory
+    std.fs.cwd().makeDir(name) catch |err| {
+        if (err != error.PathAlreadyExists) return err;
+        nexus.console.warn("Directory '{s}' already exists", .{name});
+    };
+
+    // Create subdirectories
+    const dirs = [_][]const u8{ "src", "static", "tests" };
+    for (dirs) |dir| {
+        const full_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ name, dir });
+        defer allocator.free(full_path);
+        std.fs.cwd().makeDir(full_path) catch |err| {
+            if (err != error.PathAlreadyExists) return err;
+        };
+    }
+
+    // Create main.zig
+    const main_zig_path = try std.fmt.allocPrint(allocator, "{s}/src/main.zig", .{name});
+    defer allocator.free(main_zig_path);
+
+    const main_content =
+        \\const std = @import("std");
+        \\const nexus = @import("nexus");
+        \\
+        \\pub fn main() !void {
+        \\    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+        \\    defer _ = gpa.deinit();
+        \\    const allocator = gpa.allocator();
+        \\
+        \\    // Create HTTP server
+        \\    var server = try nexus.http.Server.init(allocator, .{
+        \\        .port = 3000,
+        \\        .host = "0.0.0.0",
+        \\    });
+        \\    defer server.deinit();
+        \\
+        \\    // Add middleware
+        \\    try server.use(nexus.middleware.logger);
+        \\    try server.use(nexus.middleware.cors);
+        \\
+        \\    // Define routes
+        \\    try server.get("/", handleHome);
+        \\    try server.get("/api/hello", handleHello);
+        \\
+        \\    nexus.console.log("🚀 Server running on http://localhost:3000");
+        \\    try server.listen();
+        \\}
+        \\
+        \\fn handleHome(req: *nexus.http.Request, res: *nexus.http.Response) !void {
+        \\    _ = req;
+        \\    try res.html("<h1>Welcome to Nexus!</h1>");
+        \\}
+        \\
+        \\fn handleHello(req: *nexus.http.Request, res: *nexus.http.Response) !void {
+        \\    _ = req;
+        \\    try res.json(.{ .message = "Hello from Nexus!" });
+        \\}
+        \\
+    ;
+
+    const main_file = try std.fs.cwd().createFile(main_zig_path, .{});
+    defer main_file.close();
+    try main_file.writeAll(main_content);
+
+    // Create build.zig
+    const build_path = try std.fmt.allocPrint(allocator, "{s}/build.zig", .{name});
+    defer allocator.free(build_path);
+
+    const build_content =
+        \\const std = @import("std");
+        \\
+        \\pub fn build(b: *std.Build) void {
+        \\    const target = b.standardTargetOptions(.{});
+        \\    const optimize = b.standardOptimizeOption(.{});
+        \\
+        \\    const exe = b.addExecutable(.{
+        \\        .name = "app",
+        \\        .root_source_file = b.path("src/main.zig"),
+        \\        .target = target,
+        \\        .optimize = optimize,
+        \\    });
+        \\
+        \\    // Add nexus module (adjust path to your nexus installation)
+        \\    const nexus_mod = b.addModule("nexus", .{
+        \\        .root_source_file = b.path("../nexus/src/root.zig"),
+        \\    });
+        \\    exe.root_module.addImport("nexus", nexus_mod);
+        \\
+        \\    b.installArtifact(exe);
+        \\}
+        \\
+    ;
+
+    const build_file = try std.fs.cwd().createFile(build_path, .{});
+    defer build_file.close();
+    try build_file.writeAll(build_content);
+
+    // Create README
+    const readme_path = try std.fmt.allocPrint(allocator, "{s}/README.md", .{name});
+    defer allocator.free(readme_path);
+
+    const readme_content = try std.fmt.allocPrint(allocator,
+        \\# {s}
+        \\
+        \\A Nexus runtime application.
+        \\
+        \\## Getting Started
+        \\
+        \\```bash
+        \\# Development server with hot reload
+        \\nexus dev
+        \\
+        \\# Build for production
+        \\nexus build --release
+        \\
+        \\# Run tests
+        \\nexus test
+        \\```
+        \\
+        \\## Project Structure
+        \\
+        \\```
+        \\{s}/
+        \\├── src/
+        \\│   └── main.zig      # Application entry point
+        \\├── static/           # Static assets
+        \\├── tests/            # Test files
+        \\├── build.zig         # Build configuration
+        \\└── README.md         # This file
+        \\```
+        \\
+        \\## Documentation
+        \\
+        \\- [Nexus Documentation](https://docs.nexus.dev)
+        \\- [Zig Language](https://ziglang.org/documentation/master/)
+        \\
+    , .{ name, name });
+    defer allocator.free(readme_content);
+
+    const readme_file = try std.fs.cwd().createFile(readme_path, .{});
+    defer readme_file.close();
+    try readme_file.writeAll(readme_content);
+
+    nexus.console.info("✓ Created {s}/src/main.zig", .{name});
+    nexus.console.info("✓ Created {s}/build.zig", .{name});
+    nexus.console.info("✓ Created {s}/README.md", .{name});
+    nexus.console.info("", .{});
+    nexus.console.info("🎉 Project initialized successfully!", .{});
+    nexus.console.info("", .{});
+    nexus.console.info("Next steps:", .{});
+    nexus.console.info("  cd {s}", .{name});
+    nexus.console.info("  nexus dev", .{});
+    nexus.console.info("", .{});
+}
+
+/// Run development server with hot reload
+fn runDevServer(allocator: std.mem.Allocator, port: u16) !void {
+    nexus.console.info("🔥 Starting development server on port {d}...", .{port});
+    nexus.console.info("⚡ Hot reload enabled (not yet implemented)", .{});
+    nexus.console.info("", .{});
+
+    // For now, run the regular server
+    var server = try nexus.http.Server.init(allocator, .{
+        .port = port,
+        .host = "0.0.0.0",
+    });
+    defer server.deinit();
+
+    try server.use(nexus.middleware.logger);
+    try server.use(nexus.middleware.cors);
+
+    try server.route("GET", "/", handleRoot);
+    try server.route("GET", "/api/status", handleStatus);
+
+    nexus.console.info("🚀 Dev server running", .{});
+    nexus.console.info("   http://localhost:{d}", .{port});
+    nexus.console.info("", .{});
+    nexus.console.info("Press Ctrl+C to stop", .{});
+    nexus.console.info("", .{});
+
+    try server.listen();
+}
+
+/// Build project for production
+fn buildProject(allocator: std.mem.Allocator, release: bool) !void {
+    nexus.console.info("🔨 Building project...", .{});
+    nexus.console.info("   Mode: {s}", .{if (release) "Release" else "Debug"});
+    nexus.console.info("", .{});
+
+    // Run zig build
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = if (release)
+            &[_][]const u8{ "zig", "build", "-Doptimize=ReleaseFast" }
+        else
+            &[_][]const u8{ "zig", "build" },
+    }) catch |err| {
+        nexus.console.@"error"("Build failed: {}", .{err});
+        return err;
+    };
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    if (result.term.Exited != 0) {
+        nexus.console.@"error"("Build failed", .{});
+        nexus.console.@"error"("{s}", .{result.stderr});
+        return error.BuildFailed;
+    }
+
+    nexus.console.info("✓ Build successful!", .{});
+    nexus.console.info("   Output: ./zig-out/bin/", .{});
+    nexus.console.info("", .{});
+}
+
+/// Deploy project to target environment
+fn deployProject(allocator: std.mem.Allocator, target: []const u8) !void {
+    _ = allocator;
+
+    nexus.console.info("🚀 Deploying to: {s}", .{target});
+    nexus.console.info("", .{});
+
+    if (std.mem.eql(u8, target, "aws")) {
+        nexus.console.info("Deployment targets:", .{});
+        nexus.console.info("  • AWS Lambda", .{});
+        nexus.console.info("  • AWS ECS", .{});
+        nexus.console.info("  • AWS EC2", .{});
+    } else if (std.mem.eql(u8, target, "docker")) {
+        nexus.console.info("Building Docker container...", .{});
+        nexus.console.info("  FROM scratch", .{});
+        nexus.console.info("  COPY zig-out/bin/app /app", .{});
+        nexus.console.info("  ENTRYPOINT [\"/app\"]", .{});
+    } else if (std.mem.eql(u8, target, "fly")) {
+        nexus.console.info("Deploying to Fly.io...", .{});
+    } else {
+        nexus.console.info("Deploying to: {s}", .{target});
+    }
+
+    nexus.console.info("", .{});
+    nexus.console.warn("⚠ Deployment not fully implemented yet", .{});
+    nexus.console.info("", .{});
+    nexus.console.info("Manual deployment:", .{});
+    nexus.console.info("  1. Build with: nexus build --release", .{});
+    nexus.console.info("  2. Upload binary from: ./zig-out/bin/", .{});
+    nexus.console.info("  3. Run on server", .{});
+    nexus.console.info("", .{});
 }

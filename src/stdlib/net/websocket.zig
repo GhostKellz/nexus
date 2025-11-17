@@ -102,20 +102,44 @@ pub const FrameHeader = struct {
 
 /// WebSocket connection
 pub const WebSocket = struct {
-    stream: std.Io.net.Socket.Handle,
+    stream: std.net.Stream,
     allocator: std.mem.Allocator,
     is_closed: bool = false,
+    id: []const u8,
+    room: ?[]const u8 = null,
 
-    pub fn init(allocator: std.mem.Allocator, stream: std.Io.net.Socket.Handle) WebSocket {
+    pub fn init(allocator: std.mem.Allocator, stream: std.net.Stream, id: []const u8) !WebSocket {
+        const id_copy = try allocator.dupe(u8, id);
         return WebSocket{
             .stream = stream,
             .allocator = allocator,
+            .id = id_copy,
         };
     }
 
     pub fn deinit(self: *WebSocket) void {
         if (!self.is_closed) {
             self.close() catch {};
+        }
+        self.allocator.free(self.id);
+        if (self.room) |room| {
+            self.allocator.free(room);
+        }
+    }
+
+    /// Join a room
+    pub fn join(self: *WebSocket, room_name: []const u8) !void {
+        if (self.room) |old_room| {
+            self.allocator.free(old_room);
+        }
+        self.room = try self.allocator.dupe(u8, room_name);
+    }
+
+    /// Leave current room
+    pub fn leave(self: *WebSocket) void {
+        if (self.room) |room| {
+            self.allocator.free(room);
+            self.room = null;
         }
     }
 
@@ -136,7 +160,7 @@ pub const WebSocket = struct {
         try header.write(writer);
         try buffer.appendSlice(self.allocator, data);
 
-        try self.stream.writeAll(buffer.items);
+        _ = try self.stream.writeAll(buffer.items);
     }
 
     pub fn sendText(self: *WebSocket, text: []const u8) !void {
@@ -189,7 +213,7 @@ pub const WebSocket = struct {
     pub fn close(self: *WebSocket) !void {
         if (self.is_closed) return;
 
-        try self.send(&[_]u8{}, .close);
+        self.send(&[_]u8{}, .close) catch {};
         self.stream.close();
         self.is_closed = true;
     }
@@ -231,30 +255,125 @@ pub const Message = struct {
     }
 };
 
-/// WebSocket server
+/// WebSocket server with broadcast and room support
 pub const WebSocketServer = struct {
     tcp_server: tcp.TcpServer,
     allocator: std.mem.Allocator,
+    clients: std.ArrayList(*WebSocket),
+    next_id: usize = 0,
+    mutex: std.Thread.Mutex = .{},
 
     pub fn init(allocator: std.mem.Allocator, host: []const u8, port: u16) !WebSocketServer {
         const tcp_server = try tcp.TcpServer.init(allocator, host, port);
         return WebSocketServer{
             .tcp_server = tcp_server,
             .allocator = allocator,
+            .clients = std.ArrayList(*WebSocket).init(allocator),
         };
     }
 
     pub fn deinit(self: *WebSocketServer) void {
+        // Close all connections
+        for (self.clients.items) |client| {
+            client.deinit();
+            self.allocator.destroy(client);
+        }
+        self.clients.deinit();
         self.tcp_server.deinit();
     }
 
-    pub fn accept(self: *WebSocketServer) !WebSocket {
+    pub fn accept(self: *WebSocketServer) !*WebSocket {
         var conn = try self.tcp_server.accept();
 
         // Perform WebSocket handshake
         try performHandshake(self.allocator, &conn);
 
-        return WebSocket.init(self.allocator, conn.stream);
+        // Generate unique ID
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const id = try std.fmt.allocPrint(self.allocator, "ws_{d}", .{self.next_id});
+        defer self.allocator.free(id);
+        self.next_id += 1;
+
+        // Create WebSocket and add to clients
+        const ws = try self.allocator.create(WebSocket);
+        ws.* = try WebSocket.init(self.allocator, conn.stream, id);
+        try self.clients.append(ws);
+
+        return ws;
+    }
+
+    /// Broadcast message to all connected clients
+    pub fn broadcast(self: *WebSocketServer, message: []const u8, opcode: Opcode) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var i: usize = 0;
+        while (i < self.clients.items.len) {
+            const client = self.clients.items[i];
+            if (client.is_closed) {
+                // Remove closed connections
+                _ = self.clients.swapRemove(i);
+                client.deinit();
+                self.allocator.destroy(client);
+            } else {
+                client.send(message, opcode) catch |err| {
+                    std.debug.print("Broadcast error for client {s}: {}\n", .{ client.id, err });
+                };
+                i += 1;
+            }
+        }
+    }
+
+    /// Broadcast to specific room
+    pub fn broadcastToRoom(self: *WebSocketServer, room: []const u8, message: []const u8, opcode: Opcode) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (self.clients.items) |client| {
+            if (client.room) |client_room| {
+                if (std.mem.eql(u8, client_room, room) and !client.is_closed) {
+                    client.send(message, opcode) catch |err| {
+                        std.debug.print("Room broadcast error for client {s}: {}\n", .{ client.id, err });
+                    };
+                }
+            }
+        }
+    }
+
+    /// Broadcast to all except one client
+    pub fn broadcastExcept(self: *WebSocketServer, except_id: []const u8, message: []const u8, opcode: Opcode) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (self.clients.items) |client| {
+            if (!std.mem.eql(u8, client.id, except_id) and !client.is_closed) {
+                client.send(message, opcode) catch |err| {
+                    std.debug.print("Broadcast error for client {s}: {}\n", .{ client.id, err });
+                };
+            }
+        }
+    }
+
+    /// Get number of connected clients
+    pub fn clientCount(self: *WebSocketServer) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.clients.items.len;
+    }
+
+    /// Remove a client from the server
+    pub fn removeClient(self: *WebSocketServer, ws: *WebSocket) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (self.clients.items, 0..) |client, i| {
+            if (client == ws) {
+                _ = self.clients.swapRemove(i);
+                break;
+            }
+        }
     }
 
     fn performHandshake(allocator: std.mem.Allocator, conn: *tcp.TcpConnection) !void {

@@ -76,6 +76,7 @@ pub const net = struct {
     pub const WebSocketServer = @import("stdlib/net/websocket.zig").WebSocketServer;
     pub const WebSocketMessage = @import("stdlib/net/websocket.zig").Message;
     pub const WebSocketOpcode = @import("stdlib/net/websocket.zig").Opcode;
+    pub const WebSocketFrameHeader = @import("stdlib/net/websocket.zig").FrameHeader;
 };
 
 // HTTP
@@ -87,6 +88,24 @@ pub const http = struct {
     pub const Method = @import("stdlib/net/http.zig").Method;
     pub const StatusCode = @import("stdlib/net/http.zig").StatusCode;
     pub const Headers = @import("stdlib/net/http.zig").Headers;
+    pub const CookieOptions = @import("stdlib/net/http.zig").CookieOptions;
+};
+
+// HTTP/2
+pub const http2 = struct {
+    pub const Server = @import("stdlib/net/http2.zig").Server;
+    pub const Connection = @import("stdlib/net/http2.zig").Connection;
+    pub const FrameType = @import("stdlib/net/http2.zig").FrameType;
+    pub const FrameHeader = @import("stdlib/net/http2.zig").FrameHeader;
+    pub const Stream = @import("stdlib/net/http2.zig").Stream;
+    pub const Settings = @import("stdlib/net/http2.zig").Settings;
+};
+
+// Static files
+pub const static = struct {
+    pub const serveFile = @import("stdlib/net/static.zig").serveFile;
+    pub const staticHandler = @import("stdlib/net/static.zig").staticHandler;
+    pub const getMimeType = @import("stdlib/net/static.zig").getMimeType;
 };
 
 // Streams
@@ -127,6 +146,28 @@ pub const middleware = struct {
     pub const compression = @import("stdlib/net/middleware.zig").compression;
     pub const bodyParser = @import("stdlib/net/middleware.zig").bodyParser;
     pub const auth = @import("stdlib/net/middleware.zig").auth;
+};
+
+// Package management
+pub const pkg = struct {
+    pub const ZimClient = @import("stdlib/package/zim.zig").ZimClient;
+    pub const PackageInfo = @import("stdlib/package/zim.zig").PackageInfo;
+    pub const Manifest = @import("stdlib/package/zim.zig").Manifest;
+};
+
+// Database drivers
+pub const db = struct {
+    // PostgreSQL
+    pub const PostgresConnection = @import("stdlib/db/postgres.zig").Connection;
+    pub const PostgresPool = @import("stdlib/db/postgres.zig").Pool;
+    pub const PostgresConfig = @import("stdlib/db/postgres.zig").ConnectionConfig;
+    pub const PostgresQueryResult = @import("stdlib/db/postgres.zig").QueryResult;
+    pub const PostgresRow = @import("stdlib/db/postgres.zig").Row;
+
+    // Redis
+    pub const RedisClient = @import("stdlib/db/redis.zig").Client;
+    pub const RedisConfig = @import("stdlib/db/redis.zig").ConnectionConfig;
+    pub const RedisValue = @import("stdlib/db/redis.zig").Value;
 };
 
 // Convenience re-exports for cleaner API
