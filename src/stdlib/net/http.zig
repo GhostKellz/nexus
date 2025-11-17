@@ -1,5 +1,6 @@
 const std = @import("std");
 const tcp = @import("tcp.zig");
+const http_parser = @import("http_parser.zig");
 
 pub const Method = enum {
     GET,
@@ -71,23 +72,33 @@ pub const Headers = struct {
 pub const Request = struct {
     method: Method,
     path: []const u8,
+    query_string: ?[]const u8 = null,
     headers: Headers,
-    body: ?[]const u8 = null,
+    body: []const u8,
     allocator: std.mem.Allocator,
+    parsed: http_parser.RequestParser.ParsedRequest,
 
     pub fn deinit(self: *Request) void {
-        self.allocator.free(self.path);
         self.headers.deinit();
-        if (self.body) |b| self.allocator.free(b);
+        self.parsed.deinit();
     }
 
     pub fn readBody(self: *Request) ![]const u8 {
-        if (self.body) |b| return b;
-        return &[_]u8{};
+        return self.body;
     }
 
     pub fn getHeader(self: *Request, key: []const u8) ?[]const u8 {
-        return self.headers.get(key);
+        return self.parsed.getHeader(key);
+    }
+
+    pub fn getQuery(self: *Request, key: []const u8) ?[]const u8 {
+        return self.parsed.getQuery(key);
+    }
+
+    /// Parse JSON body into a type
+    pub fn jsonBody(self: *Request, comptime T: type) !T {
+        const parsed = try std.json.parseFromSlice(T, self.allocator, self.body, .{});
+        return parsed.value;
     }
 };
 
@@ -342,39 +353,24 @@ pub const Server = struct {
     fn parseRequest(self: *Server, allocator: std.mem.Allocator, data: []const u8) !Request {
         _ = self;
 
-        var lines = std.mem.splitScalar(u8, data, '\n');
+        // Use real HTTP parser
+        var parser = http_parser.RequestParser.init(allocator);
+        var parsed = try parser.parse(data);
 
-        // Parse request line
-        const request_line = lines.next() orelse return error.InvalidRequest;
-        var parts = std.mem.splitScalar(u8, request_line, ' ');
+        // Convert to Request struct
+        const method = Method.fromString(parsed.method) orelse return error.InvalidMethod;
 
-        const method_str = parts.next() orelse return error.InvalidRequest;
-        const method = Method.fromString(method_str) orelse return error.InvalidMethod;
-
-        const path = parts.next() orelse return error.InvalidRequest;
-        const path_trimmed = std.mem.trim(u8, path, "\r");
-
-        // Parse headers
-        var headers = Headers.init(allocator);
-        errdefer headers.deinit();
-
-        while (lines.next()) |line| {
-            const trimmed = std.mem.trim(u8, line, "\r");
-            if (trimmed.len == 0) break;
-
-            var header_parts = std.mem.splitScalar(u8, trimmed, ':');
-            const key = header_parts.next() orelse continue;
-            const value = header_parts.rest();
-            const value_trimmed = std.mem.trim(u8, value, " ");
-
-            try headers.set(key, value_trimmed);
-        }
+        // Create headers (already in parsed.headers)
+        const headers = Headers.init(allocator);
 
         return Request{
             .method = method,
-            .path = try allocator.dupe(u8, path_trimmed),
+            .path = parsed.path,
+            .query_string = parsed.query_string,
             .headers = headers,
+            .body = parsed.body,
             .allocator = allocator,
+            .parsed = parsed,
         };
     }
 };

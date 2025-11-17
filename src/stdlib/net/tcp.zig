@@ -28,8 +28,11 @@ pub const TcpServer = struct {
 
     pub fn deinit(self: *TcpServer) void {
         self.server.deinit(self.io.io());
-        self.io.deinit();
-        self.allocator.destroy(self.io);
+
+        // Properly deinit Io.Threaded
+        const io_ptr = self.io;
+        io_ptr.deinit();
+        self.allocator.destroy(io_ptr);
     }
 
     pub fn accept(self: *TcpServer) !TcpConnection {
