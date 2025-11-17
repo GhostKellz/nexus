@@ -111,6 +111,15 @@ pub const console = struct {
     pub const clear = @import("stdlib/console/console.zig").clear;
 };
 
+// gRPC
+pub const grpc = struct {
+    pub const Server = @import("stdlib/net/grpc.zig").Server;
+    pub const Method = @import("stdlib/net/grpc.zig").Method;
+    pub const MethodHandler = @import("stdlib/net/grpc.zig").MethodHandler;
+    pub const ServiceConfig = @import("stdlib/net/grpc.zig").ServiceConfig;
+    pub const Protobuf = @import("stdlib/net/grpc.zig").Protobuf;
+};
+
 // Convenience re-exports for cleaner API
 pub const EventLoop = runtime.EventLoop;
 pub const Server = http.Server;
