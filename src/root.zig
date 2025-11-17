@@ -120,6 +120,15 @@ pub const grpc = struct {
     pub const Protobuf = @import("stdlib/net/grpc.zig").Protobuf;
 };
 
+// Middleware
+pub const middleware = struct {
+    pub const logger = @import("stdlib/net/middleware.zig").logger;
+    pub const cors = @import("stdlib/net/middleware.zig").cors;
+    pub const compression = @import("stdlib/net/middleware.zig").compression;
+    pub const bodyParser = @import("stdlib/net/middleware.zig").bodyParser;
+    pub const auth = @import("stdlib/net/middleware.zig").auth;
+};
+
 // Convenience re-exports for cleaner API
 pub const EventLoop = runtime.EventLoop;
 pub const Server = http.Server;

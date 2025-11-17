@@ -268,6 +268,7 @@ pub const Server = struct {
     config: ServerConfig,
     tcp_server: tcp.TcpServer,
     routes: std.ArrayList(Route),
+    middlewares: std.ArrayList(*const fn (*Request, *Response, *const fn () anyerror!void) anyerror!void),
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator, config: ServerConfig) !Server {
@@ -277,6 +278,7 @@ pub const Server = struct {
             .config = config,
             .tcp_server = tcp_server,
             .routes = .{},
+            .middlewares = .{},
             .allocator = allocator,
         };
     }
@@ -287,6 +289,12 @@ pub const Server = struct {
             route_item.deinit();
         }
         self.routes.deinit(self.allocator);
+        self.middlewares.deinit(self.allocator);
+    }
+
+    /// Add middleware to server
+    pub fn use(self: *Server, middleware: *const fn (*Request, *Response, *const fn () anyerror!void) anyerror!void) !void {
+        try self.middlewares.append(self.allocator, middleware);
     }
 
     pub fn route(self: *Server, method: []const u8, path: []const u8, handler: RouteHandler) !void {
@@ -333,11 +341,25 @@ pub const Server = struct {
         var res = Response.init(arena_allocator, conn.stream);
         defer res.deinit();
 
+        // Execute route handler directly (middleware will be simpler pattern for now)
         // Find matching route
         var found = false;
         for (self.routes.items) |route_item| {
             if (route_item.method == req.method and std.mem.eql(u8, route_item.path, req.path)) {
-                try route_item.handler(&req, &res);
+                // Execute middlewares inline before handler
+                for (self.middlewares.items) |middleware| {
+                    const noop = struct {
+                        fn call() anyerror!void {}
+                    }.call;
+                    try middleware(&req, &res, &noop);
+                    // If response was already sent by middleware (e.g., auth failed), stop
+                    if (res.sent) break;
+                }
+
+                // Execute handler if response not sent
+                if (!res.sent) {
+                    try route_item.handler(&req, &res);
+                }
                 found = true;
                 break;
             }

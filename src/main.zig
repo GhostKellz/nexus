@@ -98,6 +98,10 @@ fn runHttpServer(allocator: std.mem.Allocator) !void {
     });
     defer server.deinit();
 
+    // Add middleware
+    try server.use(nexus.middleware.logger);
+    try server.use(nexus.middleware.cors);
+
     try server.route("GET", "/", handleRoot);
     try server.route("GET", "/api/status", handleStatus);
 
