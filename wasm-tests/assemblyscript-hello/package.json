@@ -1,0 +1,13 @@
+{
+  "name": "assemblyscript-hello-wasm",
+  "version": "0.1.0",
+  "description": "AssemblyScript WASM module for Nexus testing",
+  "scripts": {
+    "asbuild:optimized": "asc assembly/index.ts --target release --optimize --outFile build/hello.wasm",
+    "asbuild:debug": "asc assembly/index.ts --target debug --outFile build/hello.debug.wasm",
+    "build": "npm run asbuild:optimized"
+  },
+  "devDependencies": {
+    "assemblyscript": "^0.27.0"
+  }
+}

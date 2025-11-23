@@ -13,6 +13,12 @@ pub const runtime = struct {
     pub const setEventLoop = @import("runtime/event_loop.zig").setEventLoop;
 };
 
+// Hot reload for development
+pub const hot_reload = struct {
+    pub const FileWatcher = @import("runtime/hot_reload.zig").FileWatcher;
+    pub const HotReloadManager = @import("runtime/hot_reload.zig").HotReloadManager;
+};
+
 // Module system
 pub const module = struct {
     pub const ModuleLoader = @import("module/loader.zig").ModuleLoader;

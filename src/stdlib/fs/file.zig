@@ -39,6 +39,11 @@ pub const File = struct {
         else
             try std.fs.cwd().openFile(path, flags.toStdFlags());
 
+        // Seek to end if append mode
+        if (flags.append) {
+            try file.seekFromEnd(0);
+        }
+
         return File{
             .file = file,
             .path = try allocator.dupe(u8, path),
@@ -62,8 +67,19 @@ pub const File = struct {
         const buffer = try self.allocator.alloc(u8, size);
         errdefer self.allocator.free(buffer);
 
-        const bytes_read = try self.file.readAll(buffer);
-        return buffer[0..bytes_read];
+        var bytes_read: usize = 0;
+        while (bytes_read < size) {
+            const n = try self.file.read(buffer[bytes_read..]);
+            if (n == 0) break; // EOF
+            bytes_read += n;
+        }
+
+        if (bytes_read < size) {
+            // Shrink allocation to actual size read
+            const resized = try self.allocator.realloc(buffer, bytes_read);
+            return resized;
+        }
+        return buffer;
     }
 
     pub fn write(self: *File, data: []const u8) !usize {

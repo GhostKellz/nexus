@@ -125,43 +125,38 @@ pub const TimerHeap = struct {
 
 /// Task queue for async operations
 pub const TaskQueue = struct {
-    queue: std.DoublyLinkedList(Task),
+    queue: std.ArrayList(Task),
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) TaskQueue {
         return TaskQueue{
-            .queue = std.DoublyLinkedList(Task){},
+            .queue = std.ArrayList(Task).init(allocator),
             .allocator = allocator,
         };
     }
 
     pub fn deinit(self: *TaskQueue) void {
-        while (self.queue.popFirst()) |node| {
-            self.allocator.destroy(node);
-        }
+        self.queue.deinit();
     }
 
     pub fn enqueue(self: *TaskQueue, callback: TaskCallback) !void {
-        const node = try self.allocator.create(std.DoublyLinkedList(Task).Node);
-        node.* = .{ .data = Task{ .callback = callback } };
-        self.queue.append(node);
+        try self.queue.append(Task{ .callback = callback });
     }
 
     pub fn enqueueWithContext(self: *TaskQueue, callback: TaskCallback, context: ?*anyopaque) !void {
-        const node = try self.allocator.create(std.DoublyLinkedList(Task).Node);
-        node.* = .{ .data = Task{ .callback = callback, .context = context } };
-        self.queue.append(node);
+        try self.queue.append(Task{ .callback = callback, .context = context });
     }
 
     pub fn process(self: *TaskQueue) !void {
-        while (self.queue.popFirst()) |node| {
-            defer self.allocator.destroy(node);
-            try node.data.callback(&node.data);
+        // Process all tasks, then clear
+        for (self.queue.items) |*task| {
+            try task.callback(task);
         }
+        self.queue.clearRetainingCapacity();
     }
 
     pub fn isEmpty(self: *TaskQueue) bool {
-        return self.queue.first == null;
+        return self.queue.items.len == 0;
     }
 };
 

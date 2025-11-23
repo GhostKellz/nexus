@@ -1,5 +1,6 @@
 const std = @import("std");
 const tcp = @import("tcp.zig");
+const hpack = @import("hpack.zig");
 
 /// HTTP/2 implementation for gRPC support
 /// RFC 7540 - Hypertext Transfer Protocol Version 2 (HTTP/2)
@@ -102,6 +103,36 @@ pub const Settings = struct {
     };
 };
 
+/// Stream priority
+pub const Priority = struct {
+    stream_dependency: u31 = 0,
+    weight: u8 = 16, // Default weight
+    exclusive: bool = false,
+
+    pub fn parse(data: []const u8) !Priority {
+        if (data.len < 5) return Error.InvalidFrame;
+
+        const dependency_raw = std.mem.readInt(u32, data[0..4], .big);
+        const exclusive = (dependency_raw >> 31) == 1;
+        const stream_dependency = @as(u31, @intCast(dependency_raw & 0x7FFFFFFF));
+        const weight = data[4];
+
+        return Priority{
+            .stream_dependency = stream_dependency,
+            .weight = weight,
+            .exclusive = exclusive,
+        };
+    }
+
+    pub fn write(self: Priority, buffer: []u8) !void {
+        if (buffer.len < 5) return Error.InvalidFrame;
+
+        const dependency_with_exclusive = (@as(u32, if (self.exclusive) 1 else 0) << 31) | @as(u32, self.stream_dependency);
+        std.mem.writeInt(u32, buffer[0..4], dependency_with_exclusive, .big);
+        buffer[4] = self.weight;
+    }
+};
+
 /// HTTP/2 stream
 pub const Stream = struct {
     id: u31,
@@ -109,6 +140,8 @@ pub const Stream = struct {
     window_size: i32,
     headers: std.StringHashMap([]const u8),
     data: std.ArrayList(u8),
+    priority: Priority,
+    dependency_count: u32 = 0,
     allocator: std.mem.Allocator,
 
     pub const State = enum {
@@ -128,6 +161,7 @@ pub const Stream = struct {
             .window_size = 65535,
             .headers = std.StringHashMap([]const u8).init(allocator),
             .data = std.ArrayList(u8).init(allocator),
+            .priority = Priority{},
             .allocator = allocator,
         };
     }
@@ -141,6 +175,20 @@ pub const Stream = struct {
         self.headers.deinit();
         self.data.deinit();
     }
+
+    pub fn updatePriority(self: *Stream, priority: Priority) void {
+        self.priority = priority;
+    }
+
+    pub fn incrementDependencyCount(self: *Stream) void {
+        self.dependency_count += 1;
+    }
+
+    pub fn decrementDependencyCount(self: *Stream) void {
+        if (self.dependency_count > 0) {
+            self.dependency_count -= 1;
+        }
+    }
 };
 
 /// HTTP/2 connection
@@ -150,6 +198,8 @@ pub const Connection = struct {
     streams: std.AutoHashMap(u31, *Stream),
     next_stream_id: u31 = 1,
     window_size: i32 = 65535,
+    hpack_encoder: hpack.Context,
+    hpack_decoder: hpack.Context,
     allocator: std.mem.Allocator,
     is_client: bool,
 
@@ -160,6 +210,8 @@ pub const Connection = struct {
             .tcp_conn = tcp_conn,
             .settings = Settings{},
             .streams = std.AutoHashMap(u31, *Stream).init(allocator),
+            .hpack_encoder = hpack.Context.init(allocator),
+            .hpack_decoder = hpack.Context.init(allocator),
             .allocator = allocator,
             .is_client = is_client,
         };
@@ -172,6 +224,8 @@ pub const Connection = struct {
             self.allocator.destroy(stream.*);
         }
         self.streams.deinit();
+        self.hpack_encoder.deinit();
+        self.hpack_decoder.deinit();
     }
 
     /// Send connection preface (client only)
@@ -308,21 +362,24 @@ pub const Connection = struct {
         headers: []const struct { name: []const u8, value: []const u8 },
         end_stream: bool,
     ) !void {
-        // Simplified HPACK encoding (would need full implementation)
-        var payload: std.ArrayList(u8) = .{};
-        defer payload.deinit(self.allocator);
+        // HPACK encode headers
+        var payload_buffer: [16384]u8 = undefined; // Max frame size
+        var offset: usize = 0;
 
         for (headers) |header| {
-            // Literal header field with incremental indexing
-            try payload.append(self.allocator, 0x40); // Literal header
-            try payload.append(self.allocator, @intCast(header.name.len));
-            try payload.appendSlice(self.allocator, header.name);
-            try payload.append(self.allocator, @intCast(header.value.len));
-            try payload.appendSlice(self.allocator, header.value);
+            // Use literal with incremental indexing for most headers
+            const header_len = try hpack.encodeHeader(
+                payload_buffer[offset..],
+                &self.hpack_encoder,
+                header.name,
+                header.value,
+                .literal_with_indexing,
+            );
+            offset += header_len;
         }
 
         const flags: u8 = if (end_stream) 0x05 else 0x04; // END_HEADERS | END_STREAM
-        try self.sendFrame(.headers, flags, stream_id, payload.items);
+        try self.sendFrame(.headers, flags, stream_id, payload_buffer[0..offset]);
     }
 
     /// Send DATA frame
@@ -343,6 +400,224 @@ pub const Connection = struct {
         std.mem.writeInt(u32, payload[4..8], error_code, .big);
 
         try self.sendFrame(.goaway, 0, 0, &payload);
+    }
+
+    /// Send PRIORITY frame
+    pub fn sendPriority(self: *Connection, stream_id: u31, priority: Priority) !void {
+        var payload: [5]u8 = undefined;
+        try priority.write(&payload);
+        try self.sendFrame(.priority, 0, stream_id, &payload);
+    }
+
+    /// Send WINDOW_UPDATE frame
+    pub fn sendWindowUpdate(self: *Connection, stream_id: u31, increment: u32) !void {
+        var payload: [4]u8 = undefined;
+        std.mem.writeInt(u32, &payload, increment, .big);
+        try self.sendFrame(.window_update, 0, stream_id, &payload);
+    }
+
+    /// Send RST_STREAM frame
+    pub fn sendRstStream(self: *Connection, stream_id: u31, error_code: u32) !void {
+        var payload: [4]u8 = undefined;
+        std.mem.writeInt(u32, &payload, error_code, .big);
+        try self.sendFrame(.rst_stream, 0, stream_id, &payload);
+    }
+
+    /// Process incoming frame
+    pub fn processFrame(self: *Connection, frame: struct { header: FrameHeader, payload: []u8 }) !void {
+        defer self.allocator.free(frame.payload);
+
+        switch (frame.header.type) {
+            .data => try self.handleDataFrame(frame.header, frame.payload),
+            .headers => try self.handleHeadersFrame(frame.header, frame.payload),
+            .priority => try self.handlePriorityFrame(frame.header, frame.payload),
+            .rst_stream => try self.handleRstStreamFrame(frame.header, frame.payload),
+            .settings => try self.handleSettingsFrame(frame.header, frame.payload),
+            .ping => try self.handlePingFrame(frame.header, frame.payload),
+            .goaway => try self.handleGoAwayFrame(frame.header, frame.payload),
+            .window_update => try self.handleWindowUpdateFrame(frame.header, frame.payload),
+            else => {
+                std.debug.print("Unhandled frame type: {}\n", .{frame.header.type});
+            },
+        }
+    }
+
+    fn handleDataFrame(self: *Connection, header: FrameHeader, payload: []const u8) !void {
+        const stream = self.getStream(header.stream_id) orelse return Error.StreamError;
+
+        // Update flow control window
+        stream.window_size -= @intCast(payload.len);
+        self.window_size -= @intCast(payload.len);
+
+        // Append data to stream
+        try stream.data.appendSlice(payload);
+
+        // Update stream state
+        if ((header.flags & 0x01) != 0) { // END_STREAM
+            stream.state = if (stream.state == .open) .half_closed_remote else .closed;
+        }
+
+        // Send WINDOW_UPDATE if needed
+        if (stream.window_size < 32768) {
+            const increment = 65535 - @as(u32, @intCast(stream.window_size));
+            try self.sendWindowUpdate(header.stream_id, increment);
+            stream.window_size += @intCast(increment);
+        }
+    }
+
+    fn handleHeadersFrame(self: *Connection, header: FrameHeader, payload: []const u8) !void {
+        var stream = self.getStream(header.stream_id) orelse blk: {
+            // Create new stream
+            const new_stream = try self.createStream();
+            break :blk new_stream;
+        };
+
+        // Decode HPACK-encoded headers
+        var header_data = payload;
+        var priority_len: usize = 0;
+
+        // Handle priority if present
+        if ((header.flags & 0x20) != 0) { // PRIORITY flag
+            if (payload.len >= 5) {
+                const priority = try Priority.parse(payload[0..5]);
+                stream.updatePriority(priority);
+                priority_len = 5;
+                header_data = payload[5..];
+            }
+        }
+
+        // Decode headers
+        const decoded_headers = try hpack.decodeHeaderBlock(header_data, &self.hpack_decoder, self.allocator);
+        defer {
+            for (decoded_headers.items) |h| {
+                self.allocator.free(h.name);
+                self.allocator.free(h.value);
+            }
+            decoded_headers.deinit();
+        }
+
+        // Store headers in stream
+        for (decoded_headers.items) |h| {
+            try stream.headers.put(
+                try self.allocator.dupe(u8, h.name),
+                try self.allocator.dupe(u8, h.value),
+            );
+        }
+
+        stream.state = .open;
+
+        if ((header.flags & 0x01) != 0) { // END_STREAM
+            stream.state = .half_closed_remote;
+        }
+    }
+
+    fn handlePriorityFrame(self: *Connection, header: FrameHeader, payload: []const u8) !void {
+        const stream = self.getStream(header.stream_id) orelse return Error.StreamError;
+        const priority = try Priority.parse(payload);
+
+        stream.updatePriority(priority);
+
+        // Update dependency graph
+        if (priority.stream_dependency != 0) {
+            if (self.getStream(priority.stream_dependency)) |dep_stream| {
+                dep_stream.incrementDependencyCount();
+            }
+        }
+    }
+
+    fn handleRstStreamFrame(self: *Connection, header: FrameHeader, payload: []const u8) !void {
+        _ = payload;
+
+        if (self.getStream(header.stream_id)) |stream| {
+            stream.state = .closed;
+        }
+    }
+
+    fn handleSettingsFrame(self: *Connection, header: FrameHeader, payload: []const u8) !void {
+        if ((header.flags & 0x01) != 0) { // ACK flag
+            return; // Settings acknowledged
+        }
+
+        // Parse settings
+        var offset: usize = 0;
+        while (offset + 6 <= payload.len) : (offset += 6) {
+            const setting_id = std.mem.readInt(u16, payload[offset..][0..2], .big);
+            const value = std.mem.readInt(u32, payload[offset + 2 ..][0..4], .big);
+
+            switch (setting_id) {
+                1 => self.settings.header_table_size = value,
+                2 => self.settings.enable_push = value != 0,
+                3 => self.settings.max_concurrent_streams = value,
+                4 => self.settings.initial_window_size = value,
+                5 => self.settings.max_frame_size = value,
+                6 => self.settings.max_header_list_size = value,
+                else => {},
+            }
+        }
+
+        // Send SETTINGS ACK
+        try self.sendFrame(.settings, 0x01, 0, &[_]u8{});
+    }
+
+    fn handlePingFrame(self: *Connection, header: FrameHeader, payload: []const u8) !void {
+        if ((header.flags & 0x01) == 0) { // Not ACK, send response
+            try self.sendFrame(.ping, 0x01, 0, payload);
+        }
+    }
+
+    fn handleGoAwayFrame(_: *Connection, _: FrameHeader, _: []const u8) !void {
+        // Connection is closing
+        std.debug.print("GOAWAY received, closing connection\n", .{});
+    }
+
+    fn handleWindowUpdateFrame(self: *Connection, header: FrameHeader, payload: []const u8) !void {
+        const increment = std.mem.readInt(u32, payload[0..4], .big) & 0x7FFFFFFF;
+
+        if (header.stream_id == 0) {
+            // Connection-level window update
+            self.window_size += @intCast(increment);
+        } else {
+            // Stream-level window update
+            if (self.getStream(header.stream_id)) |stream| {
+                stream.window_size += @intCast(increment);
+            }
+        }
+    }
+
+    /// Run event loop to process frames
+    pub fn runEventLoop(self: *Connection) !void {
+        while (true) {
+            const frame = self.readFrame() catch |err| {
+                if (err == error.ConnectionClosed) break;
+                return err;
+            };
+
+            try self.processFrame(frame);
+        }
+    }
+
+    /// Get sorted list of streams by priority
+    pub fn getStreamsByPriority(self: *Connection) ![]u31 {
+        var stream_ids = std.ArrayList(u31).init(self.allocator);
+        defer stream_ids.deinit();
+
+        var it = self.streams.keyIterator();
+        while (it.next()) |id| {
+            try stream_ids.append(id.*);
+        }
+
+        const ids = try stream_ids.toOwnedSlice();
+
+        // Sort by weight (simplified - real implementation would use full dependency tree)
+        std.sort.block(u31, ids, self, struct {
+            fn lessThan(conn: *Connection, a: u31, b: u31) bool {
+                const stream_a = conn.getStream(a) orelse return false;
+                const stream_b = conn.getStream(b) orelse return true;
+                return stream_a.priority.weight > stream_b.priority.weight;
+            }
+        }.lessThan);
+
+        return ids;
     }
 };
 

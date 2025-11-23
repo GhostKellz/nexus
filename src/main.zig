@@ -448,29 +448,28 @@ fn initProject(allocator: std.mem.Allocator, name: []const u8) !void {
 /// Run development server with hot reload
 fn runDevServer(allocator: std.mem.Allocator, port: u16) !void {
     nexus.console.info("🔥 Starting development server on port {d}...", .{port});
-    nexus.console.info("⚡ Hot reload enabled (not yet implemented)", .{});
+    nexus.console.info("⚡ Hot reload enabled", .{});
     nexus.console.info("", .{});
 
-    // For now, run the regular server
-    var server = try nexus.http.Server.init(allocator, .{
-        .port = port,
-        .host = "0.0.0.0",
-    });
-    defer server.deinit();
+    // Initialize hot reload manager
+    var hot_reload = try nexus.hot_reload.HotReloadManager.init(allocator, "zig build");
+    defer hot_reload.deinit();
 
-    try server.use(nexus.middleware.logger);
-    try server.use(nexus.middleware.cors);
+    // Set the run command (will be executed after rebuild)
+    const run_cmd = try std.fmt.allocPrint(allocator, "zig-out/bin/nexus serve --port {d}", .{port});
+    defer allocator.free(run_cmd);
+    try hot_reload.setRunCommand(run_cmd);
 
-    try server.route("GET", "/", handleRoot);
-    try server.route("GET", "/api/status", handleStatus);
+    // Watch directories
+    const watch_dirs = [_][]const u8{ "src", "examples" };
 
-    nexus.console.info("🚀 Dev server running", .{});
+    // Start watching (this blocks)
+    nexus.console.info("👀 Watching directories: src/, examples/", .{});
+    nexus.console.info("🚀 Server will restart automatically on file changes", .{});
     nexus.console.info("   http://localhost:{d}", .{port});
     nexus.console.info("", .{});
-    nexus.console.info("Press Ctrl+C to stop", .{});
-    nexus.console.info("", .{});
 
-    try server.listen();
+    try hot_reload.start(&watch_dirs);
 }
 
 /// Build project for production

@@ -102,13 +102,13 @@ pub const FrameHeader = struct {
 
 /// WebSocket connection
 pub const WebSocket = struct {
-    stream: std.net.Stream,
+    stream: std.Io.net.Stream,
     allocator: std.mem.Allocator,
     is_closed: bool = false,
     id: []const u8,
     room: ?[]const u8 = null,
 
-    pub fn init(allocator: std.mem.Allocator, stream: std.net.Stream, id: []const u8) !WebSocket {
+    pub fn init(allocator: std.mem.Allocator, stream: std.Io.net.Stream, id: []const u8) !WebSocket {
         const id_copy = try allocator.dupe(u8, id);
         return WebSocket{
             .stream = stream,

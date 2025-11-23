@@ -20,6 +20,12 @@ pub const RequestParser = struct {
         allocator: std.mem.Allocator,
 
         pub fn deinit(self: *ParsedRequest) void {
+            // Free all header keys and values
+            var it = self.headers.iterator();
+            while (it.next()) |entry| {
+                self.allocator.free(entry.key_ptr.*);
+                self.allocator.free(entry.value_ptr.*);
+            }
             self.headers.deinit();
         }
 
@@ -58,10 +64,26 @@ pub const RequestParser = struct {
 
     /// Parse HTTP request from raw bytes
     pub fn parse(self: *RequestParser, data: []const u8) !ParsedRequest {
-        // Split into headers and body
-        const header_end = std.mem.indexOf(u8, data, "\r\n\r\n") orelse data.len;
+        // Split into headers and body - support both CRLF and LF
+        var header_end: usize = 0;
+        var separator_len: usize = 0;
+
+        if (std.mem.indexOf(u8, data, "\r\n\r\n")) |pos| {
+            header_end = pos;
+            separator_len = 4;
+        } else if (std.mem.indexOf(u8, data, "\n\n")) |pos| {
+            header_end = pos;
+            separator_len = 2;
+        } else {
+            header_end = data.len;
+            separator_len = 0;
+        }
+
         const header_section = data[0..header_end];
-        const body = if (header_end + 4 <= data.len) data[header_end + 4 ..] else "";
+        const body = if (header_end + separator_len <= data.len)
+            data[header_end + separator_len ..]
+        else
+            "";
 
         // Parse request line
         var lines = std.mem.splitScalar(u8, header_section, '\n');

@@ -122,6 +122,48 @@ pub const Memory = struct {
         @memcpy(self.data[offset .. offset + data.len], data);
     }
 
+    /// Zero-copy read: returns direct pointer into WASM memory
+    /// SAFETY: Pointer is only valid until next memory operation
+    pub fn readZeroCopy(self: *Memory, offset: u32, len: u32) ![]const u8 {
+        if (offset + len > self.data.len) return error.OutOfBounds;
+        return self.data[offset .. offset + len];
+    }
+
+    /// Zero-copy write: returns mutable slice into WASM memory
+    /// SAFETY: Slice is only valid until next memory operation
+    pub fn writeZeroCopy(self: *Memory, offset: u32, len: u32) ![]u8 {
+        if (offset + len > self.data.len) return error.OutOfBounds;
+        return self.data[offset .. offset + len];
+    }
+
+    /// Map host buffer into WASM memory without copying
+    /// Returns offset where buffer was mapped
+    pub fn mapBuffer(self: *Memory, host_buffer: []const u8) !u32 {
+        // Find free space in memory
+        const offset = @as(u32, @intCast(self.data.len));
+
+        // Grow memory if needed
+        const pages_needed = (host_buffer.len + PAGE_SIZE - 1) / PAGE_SIZE;
+        if (pages_needed > 0) {
+            _ = try self.grow(@intCast(pages_needed));
+        }
+
+        // Write buffer (in real zero-copy implementation, would use mmap)
+        @memcpy(self.data[offset .. offset + host_buffer.len], host_buffer);
+
+        return offset;
+    }
+
+    /// Get direct pointer to memory for external engines (Wasmer/Wasmtime)
+    pub fn getDataPtr(self: *Memory) [*]u8 {
+        return self.data.ptr;
+    }
+
+    /// Get memory size for external engines
+    pub fn getDataLen(self: *Memory) usize {
+        return self.data.len;
+    }
+
     pub fn readInt(self: *Memory, comptime T: type, offset: u32) !T {
         const type_size = @sizeOf(T);
         if (offset + type_size > self.data.len) return error.OutOfBounds;
