@@ -95,6 +95,9 @@ pub const http = struct {
     pub const StatusCode = @import("stdlib/net/http.zig").StatusCode;
     pub const Headers = @import("stdlib/net/http.zig").Headers;
     pub const CookieOptions = @import("stdlib/net/http.zig").CookieOptions;
+
+    // HTTP Client
+    pub const Client = @import("stdlib/net/http_client.zig").Client;
 };
 
 // HTTP/2

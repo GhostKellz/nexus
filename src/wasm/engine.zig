@@ -29,14 +29,14 @@ pub const Value = union(ValueType) {
     pub fn fromZig(value: anytype) Value {
         const T = @TypeOf(value);
         return switch (@typeInfo(T)) {
-            .Int => |int_info| {
+            .int => |int_info| {
                 if (int_info.bits <= 32) {
                     return Value{ .i32 = @intCast(value) };
                 } else {
                     return Value{ .i64 = @intCast(value) };
                 }
             },
-            .Float => |float_info| {
+            .float => |float_info| {
                 if (float_info.bits <= 32) {
                     return Value{ .f32 = @floatCast(value) };
                 } else {
@@ -362,9 +362,9 @@ pub const Module = struct {
 
     pub fn load(allocator: std.mem.Allocator, path: []const u8) !Module {
         const wasm_bytes = try std.fs.cwd().readFileAlloc(
-            allocator,
             path,
-            10 * 1024 * 1024, // 10MB max
+            allocator,
+            @enumFromInt(10 * 1024 * 1024), // 10MB max
         );
         defer allocator.free(wasm_bytes);
 

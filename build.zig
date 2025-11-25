@@ -89,6 +89,29 @@ pub fn build(b: *std.Build) void {
     // by passing `--prefix` or `-p`.
     b.installArtifact(exe);
 
+    // Add ZigScript runtime executable
+    const zs_exe = b.addExecutable(.{
+        .name = "nexus-zs",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/zigscript/cli.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "nexus", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(zs_exe);
+
+    // Add ZigScript run step
+    const zs_step = b.step("zs", "Run ZigScript runtime");
+    const run_zs = b.addRunArtifact(zs_exe);
+    zs_step.dependOn(&run_zs.step);
+    run_zs.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        run_zs.addArgs(args);
+    }
+
     // This creates a top level step. Top level steps have a name and can be
     // invoked by name when running `zig build` (e.g. `zig build run`).
     // This will evaluate the `run` step rather than the default step.

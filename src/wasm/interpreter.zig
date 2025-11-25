@@ -108,27 +108,26 @@ pub const Opcode = enum(u8) {
 
 /// Stack for WASM execution
 pub const Stack = struct {
-    values: std.ArrayList(engine.Value),
+    values: std.ArrayListUnmanaged(engine.Value),
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) Stack {
         return Stack{
-            .values = std.ArrayList(engine.Value).init(allocator),
+            .values = .{},
             .allocator = allocator,
         };
     }
 
     pub fn deinit(self: *Stack) void {
-        self.values.deinit();
+        self.values.deinit(self.allocator);
     }
 
     pub fn push(self: *Stack, value: engine.Value) !void {
-        try self.values.append(value);
+        try self.values.append(self.allocator, value);
     }
 
     pub fn pop(self: *Stack) !engine.Value {
-        if (self.values.items.len == 0) return error.StackUnderflow;
-        return self.values.pop();
+        return self.values.pop() orelse return error.StackUnderflow;
     }
 
     pub fn peek(self: *Stack) !engine.Value {
@@ -147,26 +146,26 @@ pub const Stack = struct {
 
 /// Local variables frame
 pub const LocalsFrame = struct {
-    values: std.ArrayList(engine.Value),
+    values: std.ArrayListUnmanaged(engine.Value),
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator, count: usize) !LocalsFrame {
         var frame = LocalsFrame{
-            .values = std.ArrayList(engine.Value).init(allocator),
+            .values = .{},
             .allocator = allocator,
         };
 
         // Initialize locals to zero
         var i: usize = 0;
         while (i < count) : (i += 1) {
-            try frame.values.append(engine.Value{ .i32 = 0 });
+            try frame.values.append(allocator, engine.Value{ .i32 = 0 });
         }
 
         return frame;
     }
 
     pub fn deinit(self: *LocalsFrame) void {
-        self.values.deinit();
+        self.values.deinit(self.allocator);
     }
 
     pub fn get(self: *LocalsFrame, index: u32) !engine.Value {
@@ -404,7 +403,7 @@ pub const Interpreter = struct {
 /// Read LEB128 encoded integer
 fn readLEB128(comptime T: type, data: []const u8, pc: *usize) !T {
     var result: T = 0;
-    var shift: u6 = 0;
+    var shift: u7 = 0;
     var i: usize = 0;
 
     while (i < @sizeOf(T) + 1) : (i += 1) {
@@ -414,12 +413,12 @@ fn readLEB128(comptime T: type, data: []const u8, pc: *usize) !T {
         pc.* += 1;
 
         const value = @as(T, byte & 0x7F);
-        result |= value << shift;
+        result |= value << @intCast(shift);
 
         if ((byte & 0x80) == 0) {
             // Sign extend for signed types
-            if (@typeInfo(T).Int.signedness == .signed and shift < @bitSizeOf(T) and (byte & 0x40) != 0) {
-                result |= @as(T, -1) << shift;
+            if (@typeInfo(T).int.signedness == .signed and shift < @bitSizeOf(T) and (byte & 0x40) != 0) {
+                result |= @as(T, -1) << @intCast(shift);
             }
             return result;
         }

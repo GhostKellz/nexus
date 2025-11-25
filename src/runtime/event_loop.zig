@@ -57,9 +57,11 @@ pub const TimerHeap = struct {
     }
 
     pub fn setTimeout(self: *TimerHeap, delay_ms: u64, callback: TimerCallback) !u64 {
+        var timer_start = try std.time.Timer.start();
+        const now_ms = @as(i64, @intCast(timer_start.read() / std.time.ns_per_ms));
         const timer = Timer{
             .id = self.next_id,
-            .deadline = std.time.milliTimestamp() + @as(i64, @intCast(delay_ms)),
+            .deadline = now_ms + @as(i64, @intCast(delay_ms)),
             .callback = callback,
             .repeat = null,
         };
@@ -69,9 +71,11 @@ pub const TimerHeap = struct {
     }
 
     pub fn setInterval(self: *TimerHeap, interval_ms: u64, callback: TimerCallback) !u64 {
+        const now = try std.time.Instant.now();
+        const now_ms = @as(i64, @intCast(now.order(.{}) / std.time.ns_per_ms));
         const timer = Timer{
             .id = self.next_id,
-            .deadline = std.time.milliTimestamp() + @as(i64, @intCast(interval_ms)),
+            .deadline = now_ms + @as(i64, @intCast(interval_ms)),
             .callback = callback,
             .repeat = interval_ms,
         };
@@ -82,8 +86,7 @@ pub const TimerHeap = struct {
 
     pub fn clearTimer(self: *TimerHeap, id: u64) void {
         // Mark timer as cancelled - will be skipped during processing
-        var it = self.timers.iterator();
-        while (it.next()) |timer| {
+        for (self.timers.items) |*timer| {
             if (timer.id == id) {
                 timer.cancelled = true;
                 return;
@@ -92,7 +95,8 @@ pub const TimerHeap = struct {
     }
 
     pub fn processExpired(self: *TimerHeap) !void {
-        const now = std.time.milliTimestamp();
+        var timer_obj = try std.time.Timer.start();
+        const now = @as(i64, @intCast(timer_obj.read() / std.time.ns_per_ms));
 
         while (self.timers.peek()) |timer| {
             if (timer.deadline > now) break;
@@ -115,7 +119,8 @@ pub const TimerHeap = struct {
 
     pub fn nextTimeout(self: *TimerHeap) ?u64 {
         if (self.timers.peek()) |timer| {
-            const now = std.time.milliTimestamp();
+            var timer_obj = std.time.Timer.start() catch return 0;
+            const now = @as(i64, @intCast(timer_obj.read() / std.time.ns_per_ms));
             const diff = timer.deadline - now;
             return @max(0, @as(u64, @intCast(diff)));
         }
@@ -125,26 +130,26 @@ pub const TimerHeap = struct {
 
 /// Task queue for async operations
 pub const TaskQueue = struct {
-    queue: std.ArrayList(Task),
+    queue: std.ArrayListUnmanaged(Task),
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) TaskQueue {
         return TaskQueue{
-            .queue = std.ArrayList(Task).init(allocator),
+            .queue = .{},
             .allocator = allocator,
         };
     }
 
     pub fn deinit(self: *TaskQueue) void {
-        self.queue.deinit();
+        self.queue.deinit(self.allocator);
     }
 
     pub fn enqueue(self: *TaskQueue, callback: TaskCallback) !void {
-        try self.queue.append(Task{ .callback = callback });
+        try self.queue.append(self.allocator, Task{ .callback = callback });
     }
 
     pub fn enqueueWithContext(self: *TaskQueue, callback: TaskCallback, context: ?*anyopaque) !void {
-        try self.queue.append(Task{ .callback = callback, .context = context });
+        try self.queue.append(self.allocator, Task{ .callback = callback, .context = context });
     }
 
     pub fn process(self: *TaskQueue) !void {
@@ -397,7 +402,8 @@ pub const EventLoop = struct {
             const timeout = self.calculateTimeout();
 
             // 4. Poll I/O events
-            const events = try self.io_poller.poll(@intCast(timeout orelse -1));
+            const timeout_ms: i32 = if (timeout) |t| @intCast(t) else -1;
+            const events = try self.io_poller.poll(timeout_ms);
             defer self.allocator.free(events);
 
             // 5. Process I/O events
