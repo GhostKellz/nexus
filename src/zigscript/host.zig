@@ -94,12 +94,14 @@ pub const ZigScriptContext = struct {
     promises: PromiseRegistry,
     event_loop: *event_loop.EventLoop,
     allocator: std.mem.Allocator,
+    io: std.Io,
     next_string_offset: u32 = 8192, // Start after reserved memory
 
     pub fn init(
         allocator: std.mem.Allocator,
         instance: *Instance,
         loop: *event_loop.EventLoop,
+        io: std.Io,
     ) !ZigScriptContext {
         const memory = instance.getMemory() orelse return error.NoMemory;
 
@@ -109,6 +111,7 @@ pub const ZigScriptContext = struct {
             .promises = PromiseRegistry.init(allocator),
             .event_loop = loop,
             .allocator = allocator,
+            .io = io,
         };
     }
 
@@ -394,7 +397,9 @@ pub fn fs_read_file(params: []const Value, allocator: std.mem.Allocator) ![]Valu
     const promise_id = try ctx.promises.create();
 
     // Read file asynchronously
-    const file_content = std.fs.cwd().readFileAlloc(
+    const cwd = std.Io.Dir.cwd();
+    const file_content = cwd.readFileAlloc(
+        ctx.io,
         path,
         allocator,
         std.Io.Limit.limited(10 * 1024 * 1024), // 10MB max
@@ -433,7 +438,8 @@ pub fn fs_write_file(params: []const Value, allocator: std.mem.Allocator) ![]Val
     const promise_id = try ctx.promises.create();
 
     // Write file
-    std.fs.cwd().writeFile(.{ .sub_path = path, .data = content }) catch |err| {
+    const cwd = std.Io.Dir.cwd();
+    cwd.writeFile(ctx.io, .{ .sub_path = path, .data = content }) catch |err| {
         const err_msg = try std.fmt.allocPrint(allocator, "Write error: {}", .{err});
         defer allocator.free(err_msg);
         try ctx.promises.reject(promise_id, err_msg);

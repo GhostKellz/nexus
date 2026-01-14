@@ -1,10 +1,8 @@
 const std = @import("std");
 const nexus = @import("nexus");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
 
     // Welcome message
     nexus.console.info("⚡ Nexus Runtime v0.1.0", .{});
@@ -12,8 +10,7 @@ pub fn main() !void {
     nexus.console.info("", .{});
 
     // Get command line arguments
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     if (args.len < 2) {
         printUsage();
@@ -24,7 +21,7 @@ pub fn main() !void {
 
     if (std.mem.eql(u8, command, "init")) {
         const project_name = if (args.len >= 3) args[2] else "my-nexus-app";
-        try initProject(allocator, project_name);
+        try initProject(allocator, init.io, project_name);
     } else if (std.mem.eql(u8, command, "run")) {
         if (args.len < 3) {
             nexus.console.@"error"("Usage: nexus run <file.zig>", .{});
@@ -41,12 +38,12 @@ pub fn main() !void {
         const port: u16 = if (args.len >= 3) blk: {
             break :blk std.fmt.parseInt(u16, args[2], 10) catch 3000;
         } else 3000;
-        try runDevServer(allocator, port);
+        try runDevServer(allocator, init.io, port);
     } else if (std.mem.eql(u8, command, "build")) {
         const release = for (args) |arg| {
             if (std.mem.eql(u8, arg, "--release")) break true;
         } else false;
-        try buildProject(allocator, release);
+        try buildProject(allocator, init.io, release);
     } else if (std.mem.eql(u8, command, "deploy")) {
         const target = if (args.len >= 3) args[2] else "production";
         try deployProject(allocator, target);
@@ -287,11 +284,13 @@ fn handleStatus(req: *nexus.http.Request, res: *nexus.http.Response) !void {
 }
 
 /// Initialize a new Nexus project
-fn initProject(allocator: std.mem.Allocator, name: []const u8) !void {
+fn initProject(allocator: std.mem.Allocator, io: std.Io, name: []const u8) !void {
     nexus.console.info("🚀 Creating new Nexus project: {s}", .{name});
 
+    const cwd = std.Io.Dir.cwd();
+
     // Create project directory
-    std.fs.cwd().makeDir(name) catch |err| {
+    cwd.createDir(io, name, .default_dir) catch |err| {
         if (err != error.PathAlreadyExists) return err;
         nexus.console.warn("Directory '{s}' already exists", .{name});
     };
@@ -301,7 +300,7 @@ fn initProject(allocator: std.mem.Allocator, name: []const u8) !void {
     for (dirs) |dir| {
         const full_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ name, dir });
         defer allocator.free(full_path);
-        std.fs.cwd().makeDir(full_path) catch |err| {
+        cwd.createDir(io, full_path, .default_dir) catch |err| {
             if (err != error.PathAlreadyExists) return err;
         };
     }
@@ -350,9 +349,7 @@ fn initProject(allocator: std.mem.Allocator, name: []const u8) !void {
         \\
     ;
 
-    const main_file = try std.fs.cwd().createFile(main_zig_path, .{});
-    defer main_file.close();
-    try main_file.writeAll(main_content);
+    try cwd.writeFile(io, .{ .sub_path = main_zig_path, .data = main_content });
 
     // Create build.zig
     const build_path = try std.fmt.allocPrint(allocator, "{s}/build.zig", .{name});
@@ -383,9 +380,7 @@ fn initProject(allocator: std.mem.Allocator, name: []const u8) !void {
         \\
     ;
 
-    const build_file = try std.fs.cwd().createFile(build_path, .{});
-    defer build_file.close();
-    try build_file.writeAll(build_content);
+    try cwd.writeFile(io, .{ .sub_path = build_path, .data = build_content });
 
     // Create README
     const readme_path = try std.fmt.allocPrint(allocator, "{s}/README.md", .{name});
@@ -429,9 +424,7 @@ fn initProject(allocator: std.mem.Allocator, name: []const u8) !void {
     , .{ name, name });
     defer allocator.free(readme_content);
 
-    const readme_file = try std.fs.cwd().createFile(readme_path, .{});
-    defer readme_file.close();
-    try readme_file.writeAll(readme_content);
+    try cwd.writeFile(io, .{ .sub_path = readme_path, .data = readme_content });
 
     nexus.console.info("✓ Created {s}/src/main.zig", .{name});
     nexus.console.info("✓ Created {s}/build.zig", .{name});
@@ -446,13 +439,13 @@ fn initProject(allocator: std.mem.Allocator, name: []const u8) !void {
 }
 
 /// Run development server with hot reload
-fn runDevServer(allocator: std.mem.Allocator, port: u16) !void {
+fn runDevServer(allocator: std.mem.Allocator, io: std.Io, port: u16) !void {
     nexus.console.info("🔥 Starting development server on port {d}...", .{port});
     nexus.console.info("⚡ Hot reload enabled", .{});
     nexus.console.info("", .{});
 
     // Initialize hot reload manager
-    var hot_reload = try nexus.hot_reload.HotReloadManager.init(allocator, "zig build");
+    var hot_reload = try nexus.hot_reload.HotReloadManager.init(allocator, io, "zig build");
     defer hot_reload.deinit();
 
     // Set the run command (will be executed after rebuild)
@@ -473,14 +466,13 @@ fn runDevServer(allocator: std.mem.Allocator, port: u16) !void {
 }
 
 /// Build project for production
-fn buildProject(allocator: std.mem.Allocator, release: bool) !void {
+fn buildProject(allocator: std.mem.Allocator, io: std.Io, release: bool) !void {
     nexus.console.info("🔨 Building project...", .{});
     nexus.console.info("   Mode: {s}", .{if (release) "Release" else "Debug"});
     nexus.console.info("", .{});
 
     // Run zig build
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
+    const result = std.process.run(allocator, io, .{
         .argv = if (release)
             &[_][]const u8{ "zig", "build", "-Doptimize=ReleaseFast" }
         else
@@ -492,7 +484,7 @@ fn buildProject(allocator: std.mem.Allocator, release: bool) !void {
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    if (result.term.Exited != 0) {
+    if (result.term != .exited or result.term.exited != 0) {
         nexus.console.@"error"("Build failed", .{});
         nexus.console.@"error"("{s}", .{result.stderr});
         return error.BuildFailed;

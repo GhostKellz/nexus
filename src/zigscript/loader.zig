@@ -9,16 +9,19 @@ pub const ZigScriptLoader = struct {
     engine: *engine.Engine,
     event_loop: *event_loop.EventLoop,
     allocator: std.mem.Allocator,
+    io: std.Io,
 
     pub fn init(
         allocator: std.mem.Allocator,
         wasm_engine: *engine.Engine,
         loop: *event_loop.EventLoop,
+        io: std.Io,
     ) ZigScriptLoader {
         return .{
             .engine = wasm_engine,
             .event_loop = loop,
             .allocator = allocator,
+            .io = io,
         };
     }
 
@@ -27,7 +30,7 @@ pub const ZigScriptLoader = struct {
         std.debug.print("🚀 Loading ZigScript module: {s}\n", .{wasm_path});
 
         // Load WASM module
-        const module = try self.engine.loadModule(wasm_path);
+        const module = try self.engine.loadModule(self.io, wasm_path);
 
         // Get the instance (first one created during load)
         if (module.instances.items.len == 0) return error.NoInstance;
@@ -43,6 +46,7 @@ pub const ZigScriptLoader = struct {
             self.allocator,
             instance,
             self.event_loop,
+            self.io,
         );
         defer ctx.deinit();
 
@@ -69,7 +73,7 @@ pub const ZigScriptLoader = struct {
         std.debug.print("🔄 Loading ZigScript module with event loop: {s}\n", .{wasm_path});
 
         // Load WASM module
-        const module = try self.engine.loadModule(wasm_path);
+        const module = try self.engine.loadModule(self.io, wasm_path);
 
         if (module.instances.items.len == 0) return error.NoInstance;
         const instance = module.instances.items[0];
@@ -82,6 +86,7 @@ pub const ZigScriptLoader = struct {
             self.allocator,
             instance,
             self.event_loop,
+            self.io,
         );
         defer ctx.deinit();
 
@@ -168,28 +173,30 @@ pub const ZigScriptLoader = struct {
         errdefer self.allocator.free(wasm_path);
 
         // Run ZigScript compiler
-        var child = std.process.Child.init(
-            &[_][]const u8{ "zs", "build", zs_path },
-            self.allocator,
-        );
+        var child = try std.process.spawn(self.io, .{
+            .argv = &[_][]const u8{ "zs", "build", zs_path },
+            .stdout = .inherit,
+            .stderr = .inherit,
+        });
 
-        const result = try child.spawnAndWait();
+        const result = try child.wait(self.io);
 
-        if (result != .Exited or result.Exited != 0) {
+        if (result != .exited or result.exited != 0) {
             return error.CompilationFailed;
         }
 
         std.debug.print("✅ Compiled to {s}\n", .{wat_path});
 
         // Convert WAT to WASM using wat2wasm
-        var wat2wasm = std.process.Child.init(
-            &[_][]const u8{ "wat2wasm", wat_path, "-o", wasm_path },
-            self.allocator,
-        );
+        var wat2wasm = try std.process.spawn(self.io, .{
+            .argv = &[_][]const u8{ "wat2wasm", wat_path, "-o", wasm_path },
+            .stdout = .inherit,
+            .stderr = .inherit,
+        });
 
-        const wat2wasm_result = try wat2wasm.spawnAndWait();
+        const wat2wasm_result = try wat2wasm.wait(self.io);
 
-        if (wat2wasm_result != .Exited or wat2wasm_result.Exited != 0) {
+        if (wat2wasm_result != .exited or wat2wasm_result.exited != 0) {
             return error.WatToWasmFailed;
         }
 
@@ -200,14 +207,14 @@ pub const ZigScriptLoader = struct {
 };
 
 /// Convenience function to run a ZigScript module
-pub fn run(allocator: std.mem.Allocator, path: []const u8) !i32 {
+pub fn run(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !i32 {
     var wasm_engine = engine.Engine.init(allocator);
     defer wasm_engine.deinit();
 
     var loop = try event_loop.EventLoop.init(allocator);
     defer loop.deinit();
 
-    var loader = ZigScriptLoader.init(allocator, &wasm_engine, &loop);
+    var loader = ZigScriptLoader.init(allocator, &wasm_engine, &loop, io);
 
     // Check file extension
     if (std.mem.endsWith(u8, path, ".zs")) {

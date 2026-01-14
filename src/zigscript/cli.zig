@@ -1,13 +1,10 @@
 const std = @import("std");
 const loader = @import("loader.zig");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     if (args.len < 2) {
         try printUsage();
@@ -24,7 +21,7 @@ pub fn main() !void {
         }
 
         const file_path = args[2];
-        const exit_code = try loader.run(allocator, file_path);
+        const exit_code = try loader.run(allocator, init.io, file_path);
         std.process.exit(@intCast(exit_code));
     } else if (std.mem.eql(u8, command, "help") or std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h")) {
         try printUsage();

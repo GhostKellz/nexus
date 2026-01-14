@@ -160,13 +160,15 @@ pub const Response = struct {
     body: ?[]const u8 = null,
     stream: std.Io.net.Stream,
     allocator: std.mem.Allocator,
+    io: std.Io,
     sent: bool = false,
 
-    pub fn init(allocator: std.mem.Allocator, stream: std.Io.net.Stream) Response {
+    pub fn init(allocator: std.mem.Allocator, stream: std.Io.net.Stream, io: std.Io) Response {
         return Response{
             .headers = Headers.init(allocator),
             .stream = stream,
             .allocator = allocator,
+            .io = io,
         };
     }
 
@@ -220,18 +222,21 @@ pub const Response = struct {
         // End headers
         try header_buf.appendSlice(self.allocator, "\r\n");
 
-        // Write header and body using netWrite
-        // We need the Io object - get it from TcpConnection
-        // For now, write directly using posix (we'll improve this)
+        // Write header and body using stream writer
         const header_slice = header_buf.items;
+        var write_buf: [4096]u8 = undefined;
+        var writer = self.stream.writer(self.io, &write_buf);
 
         // Write header
-        _ = try std.posix.write(self.stream.socket.handle, header_slice);
+        try writer.interface.writeAll(header_slice);
 
         // Write body if present
         if (data.len > 0) {
-            _ = try std.posix.write(self.stream.socket.handle, data);
+            try writer.interface.writeAll(data);
         }
+
+        // Flush any buffered data
+        try writer.interface.flush();
 
         self.sent = true;
     }
@@ -476,7 +481,7 @@ pub const Server = struct {
         defer req.deinit();
 
         // Create response
-        var res = Response.init(arena_allocator, conn.stream);
+        var res = Response.init(arena_allocator, conn.stream, conn.io.io());
         defer res.deinit();
 
         // Execute route handler directly (middleware will be simpler pattern for now)

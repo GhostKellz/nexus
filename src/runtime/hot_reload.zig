@@ -16,12 +16,14 @@ pub const FileWatcher = struct {
     last_modified: std.StringHashMap(std.Io.Timestamp),
     poll_interval_ms: u64 = 1000,
     allocator: std.mem.Allocator,
+    io: std.Io,
 
-    pub fn init(allocator: std.mem.Allocator) FileWatcher {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io) FileWatcher {
         return FileWatcher{
             .watch_paths = std.ArrayList([]const u8){},
             .last_modified = std.StringHashMap(std.Io.Timestamp).init(allocator),
             .allocator = allocator,
+            .io = io,
         };
     }
 
@@ -44,18 +46,21 @@ pub const FileWatcher = struct {
         try self.watch_paths.append(self.allocator, path_copy);
 
         // Record initial modification time
-        const stat = try std.fs.cwd().statFile(path);
+        const cwd = std.Io.Dir.cwd();
+        const stat = try cwd.statFile(self.io, path, .{});
         const mtime = stat.mtime;
         try self.last_modified.put(path_copy, mtime);
     }
 
     /// Add directory recursively
     pub fn addDirectory(self: *FileWatcher, dir_path: []const u8, pattern: []const u8) !void {
-        var dir = try std.fs.cwd().openDir(dir_path, .{ .iterate = true });
-        defer dir.close();
+        const cwd = std.Io.Dir.cwd();
+        var dir = try cwd.openDir(self.io, dir_path, .{ .iterate = true });
+        defer dir.close(self.io);
 
-        var it = dir.iterate();
-        while (try it.next()) |entry| {
+        var dir_reader_buf: [2048]u8 align(@alignOf(usize)) = undefined;
+        var dir_reader = std.Io.Dir.Reader.init(dir, &dir_reader_buf);
+        while (try dir_reader.next(self.io)) |entry| {
             if (entry.kind == .file) {
                 // Check if file matches pattern (e.g., "*.zig")
                 if (matchesPattern(entry.name, pattern)) {
@@ -79,8 +84,9 @@ pub const FileWatcher = struct {
         var changed_files = std.ArrayList([]const u8){};
         errdefer changed_files.deinit(self.allocator);
 
+        const cwd = std.Io.Dir.cwd();
         for (self.watch_paths.items) |path| {
-            const stat = std.fs.cwd().statFile(path) catch continue;
+            const stat = cwd.statFile(self.io, path, .{}) catch continue;
             const mtime = stat.mtime;
 
             if (self.last_modified.get(path)) |last_mtime| {
@@ -134,13 +140,15 @@ pub const HotReloadManager = struct {
     run_command: ?[]const u8,
     process: ?std.process.Child = null,
     allocator: std.mem.Allocator,
+    io: std.Io,
 
-    pub fn init(allocator: std.mem.Allocator, build_command: []const u8) !HotReloadManager {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, build_command: []const u8) !HotReloadManager {
         return HotReloadManager{
-            .watcher = FileWatcher.init(allocator),
+            .watcher = FileWatcher.init(allocator, io),
             .build_command = try allocator.dupe(u8, build_command),
             .run_command = null,
             .allocator = allocator,
+            .io = io,
         };
     }
 
@@ -152,7 +160,7 @@ pub const HotReloadManager = struct {
         }
 
         if (self.process) |*proc| {
-            _ = proc.kill() catch {};
+            proc.kill(self.io);
         }
     }
 
@@ -177,14 +185,16 @@ pub const HotReloadManager = struct {
             try args.append(self.allocator, arg);
         }
 
-        var child = std.process.Child.init(args.items, self.allocator);
-        child.stdout_behavior = .Inherit;
-        child.stderr_behavior = .Inherit;
+        var child = try std.process.spawn(self.io, .{
+            .argv = args.items,
+            .stdout = .inherit,
+            .stderr = .inherit,
+        });
 
-        const result = try child.spawnAndWait();
+        const result = try child.wait(self.io);
 
         switch (result) {
-            .Exited => |code| {
+            .exited => |code| {
                 if (code == 0) {
                     std.debug.print("✅ Build successful\n", .{});
                     try self.restart();
@@ -205,7 +215,7 @@ pub const HotReloadManager = struct {
         // Kill existing process
         if (self.process) |*proc| {
             std.debug.print("🛑 Stopping previous instance...\n", .{});
-            _ = proc.kill() catch {};
+            proc.kill(self.io);
             self.process = null;
         }
 
@@ -221,11 +231,11 @@ pub const HotReloadManager = struct {
                 try args.append(self.allocator, arg);
             }
 
-            var child = std.process.Child.init(args.items, self.allocator);
-            child.stdout_behavior = .Inherit;
-            child.stderr_behavior = .Inherit;
-
-            try child.spawn();
+            const child = try std.process.spawn(self.io, .{
+                .argv = args.items,
+                .stdout = .inherit,
+                .stderr = .inherit,
+            });
             self.process = child;
 
             std.debug.print("✨ Server restarted\n", .{});
@@ -261,10 +271,9 @@ pub const HotReloadManager = struct {
                 };
             }
 
-            const ns_total = self.watcher.poll_interval_ms * std.time.ns_per_ms;
-            const seconds = ns_total / std.time.ns_per_s;
-            const nanoseconds = ns_total % std.time.ns_per_s;
-            std.posix.nanosleep(seconds, nanoseconds);
+            const duration = std.Io.Duration.fromMilliseconds(@intCast(self.watcher.poll_interval_ms));
+            const timeout = std.Io.Timeout{ .duration = .{ .raw = duration, .clock = .awake } };
+            timeout.sleep(self.io) catch {};
         }
     }
 };

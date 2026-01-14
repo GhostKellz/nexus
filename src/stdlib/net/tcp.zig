@@ -14,7 +14,7 @@ pub const TcpServer = struct {
         // Create Io runtime
         const io = try allocator.create(Io.Threaded);
         errdefer allocator.destroy(io);
-        io.* = Io.Threaded.init(allocator);
+        io.* = Io.Threaded.init(allocator, .{ .environ = .empty });
 
         // Listen on address
         const server = try address.listen(io.io(), .{});

@@ -95,7 +95,7 @@ pub const RequestParser = struct {
         const http_version = request_parts.next() orelse return error.InvalidVersion;
 
         // Strip \r if present
-        const clean_version = std.mem.trimRight(u8, http_version, "\r");
+        const clean_version = std.mem.trimEnd(u8, http_version, "\r");
 
         // Split path and query string
         var path: []const u8 = raw_path;
@@ -116,7 +116,7 @@ pub const RequestParser = struct {
 
             if (std.mem.indexOfScalar(u8, clean_line, ':')) |colon_pos| {
                 const header_name = clean_line[0..colon_pos];
-                const header_value = std.mem.trimLeft(u8, clean_line[colon_pos + 1 ..], " ");
+                const header_value = std.mem.trimStart(u8, clean_line[colon_pos + 1 ..], " ");
 
                 // Lowercase header name for case-insensitive lookup
                 var lowercase_buf: [256]u8 = undefined;

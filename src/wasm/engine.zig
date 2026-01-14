@@ -360,11 +360,13 @@ pub const Module = struct {
         return instance;
     }
 
-    pub fn load(allocator: std.mem.Allocator, path: []const u8) !Module {
-        const wasm_bytes = try std.fs.cwd().readFileAlloc(
+    pub fn load(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Module {
+        const cwd = std.Io.Dir.cwd();
+        const wasm_bytes = try cwd.readFileAlloc(
+            io,
             path,
             allocator,
-            @enumFromInt(10 * 1024 * 1024), // 10MB max
+            std.Io.Limit.limited(10 * 1024 * 1024), // 10MB max
         );
         defer allocator.free(wasm_bytes);
 
@@ -395,11 +397,11 @@ pub const Engine = struct {
         self.modules.deinit(self.allocator);
     }
 
-    pub fn loadModule(self: *Engine, path: []const u8) !*Module {
+    pub fn loadModule(self: *Engine, io: std.Io, path: []const u8) !*Module {
         const module_ptr = try self.allocator.create(Module);
         errdefer self.allocator.destroy(module_ptr);
 
-        module_ptr.* = try Module.load(self.allocator, path);
+        module_ptr.* = try Module.load(self.allocator, io, path);
         try self.modules.append(self.allocator, module_ptr);
 
         return module_ptr;

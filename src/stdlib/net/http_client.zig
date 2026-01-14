@@ -46,7 +46,7 @@ pub const Client = struct {
     pub fn init(allocator: std.mem.Allocator) !Client {
         const io_ptr = try allocator.create(std.Io.Threaded);
         errdefer allocator.destroy(io_ptr);
-        io_ptr.* = std.Io.Threaded.init(allocator);
+        io_ptr.* = std.Io.Threaded.init(allocator, .{ .environ = .empty });
 
         return .{
             .allocator = allocator,

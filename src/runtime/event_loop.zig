@@ -183,7 +183,10 @@ const EpollPoller = struct {
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) !EpollPoller {
-        const epoll_fd = try std.posix.epoll_create1(std.os.linux.EPOLL.CLOEXEC);
+        const rc = std.os.linux.epoll_create1(std.os.linux.EPOLL.CLOEXEC);
+        const err = std.os.linux.errno(rc);
+        if (err != .SUCCESS) return error.EpollCreateFailed;
+        const epoll_fd: std.posix.fd_t = @intCast(rc);
         const events = try allocator.alloc(std.os.linux.epoll_event, 1024);
 
         return EpollPoller{
@@ -203,25 +206,22 @@ const EpollPoller = struct {
             .events = events,
             .data = .{ .fd = fd },
         };
-        try std.posix.epoll_ctl(
-            self.epoll_fd,
-            std.os.linux.EPOLL.CTL_ADD,
-            fd,
-            &event,
-        );
+        const rc = std.os.linux.epoll_ctl(self.epoll_fd, std.os.linux.EPOLL.CTL_ADD, fd, &event);
+        const err = std.os.linux.errno(rc);
+        if (err != .SUCCESS) return error.EpollCtlFailed;
     }
 
     pub fn unregister(self: *EpollPoller, fd: std.posix.fd_t) !void {
-        try std.posix.epoll_ctl(
-            self.epoll_fd,
-            std.os.linux.EPOLL.CTL_DEL,
-            fd,
-            null,
-        );
+        const rc = std.os.linux.epoll_ctl(self.epoll_fd, std.os.linux.EPOLL.CTL_DEL, fd, null);
+        const err = std.os.linux.errno(rc);
+        if (err != .SUCCESS) return error.EpollCtlFailed;
     }
 
     pub fn poll(self: *EpollPoller, timeout_ms: i32) ![]IoEvent {
-        const count = std.posix.epoll_wait(self.epoll_fd, self.events, timeout_ms);
+        const rc = std.os.linux.epoll_wait(self.epoll_fd, self.events.ptr, @intCast(self.events.len), timeout_ms);
+        const err = std.os.linux.errno(rc);
+        if (err != .SUCCESS) return error.EpollWaitFailed;
+        const count: usize = rc;
 
         // Convert epoll events to IoEvents
         var io_events = try self.allocator.alloc(IoEvent, count);

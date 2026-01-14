@@ -51,9 +51,9 @@ pub const wasm = struct {
     pub const PolicyConfig = @import("wasm/policy.zig").PolicyConfig;
 
     /// Load and instantiate a WASM module
-    pub fn load(allocator: std.mem.Allocator, path: []const u8) !*Module {
+    pub fn load(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !*Module {
         var engine = Engine.init(allocator);
-        return try engine.loadModule(path);
+        return try engine.loadModule(io, path);
     }
 };
 
