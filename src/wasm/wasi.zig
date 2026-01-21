@@ -16,6 +16,75 @@ pub const Errno = enum(u16) {
     PERM = 63,
 };
 
+/// WASI clock identifiers
+pub const ClockId = enum(u32) {
+    REALTIME = 0,
+    MONOTONIC = 1,
+    PROCESS_CPUTIME_ID = 2,
+    THREAD_CPUTIME_ID = 3,
+};
+
+/// WASI event types for poll_oneoff
+pub const EventType = enum(u8) {
+    CLOCK = 0,
+    FD_READ = 1,
+    FD_WRITE = 2,
+};
+
+/// WASI subscription clock flags
+pub const SUBSCRIPTION_CLOCK_ABSTIME: u16 = 0x0001;
+
+/// WASI event for poll results
+pub const Event = extern struct {
+    userdata: u64,
+    @"error": u16,
+    event_type: EventType,
+    _pad: u8 = 0,
+    fd_readwrite: EventFdReadwrite,
+};
+
+/// WASI event fd readwrite data
+pub const EventFdReadwrite = extern struct {
+    nbytes: u64,
+    flags: u16,
+    _pad: [6]u8 = [_]u8{0} ** 6,
+};
+
+/// WASI subscription for poll_oneoff
+pub const Subscription = extern struct {
+    userdata: u64,
+    u: SubscriptionU,
+};
+
+/// WASI subscription union wrapper
+pub const SubscriptionU = extern struct {
+    tag: EventType,
+    _pad: [7]u8 = [_]u8{0} ** 7,
+    u: SubscriptionUnion,
+};
+
+/// WASI subscription union
+pub const SubscriptionUnion = extern union {
+    clock: SubscriptionClock,
+    fd_read: SubscriptionFdReadwrite,
+    fd_write: SubscriptionFdReadwrite,
+};
+
+/// WASI clock subscription
+pub const SubscriptionClock = extern struct {
+    id: ClockId,
+    timeout: u64,
+    precision: u64,
+    flags: u16,
+    _pad: [6]u8 = [_]u8{0} ** 6,
+};
+
+/// WASI fd read/write subscription
+pub const SubscriptionFdReadwrite = extern struct {
+    fd: i32,
+    _pad: [4]u8 = [_]u8{0} ** 4,
+};
+
 /// WASI file descriptor
 pub const Fd = u32;
 
@@ -459,14 +528,190 @@ pub const WasiHost = struct {
         return .SUCCESS;
     }
 
-    /// WASI: poll_oneoff
+    /// WASI: poll_oneoff - poll for events on subscriptions
     pub fn pollOneoff(self: *WasiHost, in_ptr: u32, out_ptr: u32, nsubscriptions: u32, nevents_ptr: u32) !Errno {
-        _ = in_ptr;
-        _ = out_ptr;
-        _ = nsubscriptions;
+        if (nsubscriptions == 0) {
+            try self.memory.writeInt(u32, nevents_ptr, 0);
+            return .SUCCESS;
+        }
 
-        // Simplified: just return 0 events
-        try self.memory.writeInt(u32, nevents_ptr, 0);
+        // Size of subscription struct (48 bytes: 8 userdata + 8 tag/padding + 32 union)
+        const subscription_size: u32 = 48;
+        const event_size: u32 = 32;
+
+        var nevents: u32 = 0;
+        var min_timeout_ns: ?u64 = null;
+        var has_fd_subscriptions = false;
+
+        // First pass: find minimum timeout and check for FD subscriptions
+        for (0..nsubscriptions) |i| {
+            const sub_offset = in_ptr + @as(u32, @intCast(i)) * subscription_size;
+
+            // Read subscription tag (event type) at offset 8
+            const tag_byte = try self.memory.readInt(u8, sub_offset + 8);
+            const tag: EventType = @enumFromInt(tag_byte);
+
+            switch (tag) {
+                .CLOCK => {
+                    // Clock subscription: read timeout
+                    // Clock data starts at offset 16: id(4) + timeout(8) + precision(8) + flags(2)
+                    const timeout = try self.memory.readInt(u64, sub_offset + 16 + 4);
+                    const flags = try self.memory.readInt(u16, sub_offset + 16 + 4 + 8 + 8);
+
+                    var effective_timeout = timeout;
+
+                    // If ABSTIME flag is set, convert absolute time to relative
+                    if ((flags & SUBSCRIPTION_CLOCK_ABSTIME) != 0) {
+                        const now = @as(u64, @intCast(std.time.nanoTimestamp()));
+                        if (timeout > now) {
+                            effective_timeout = timeout - now;
+                        } else {
+                            effective_timeout = 0;
+                        }
+                    }
+
+                    if (min_timeout_ns == null or effective_timeout < min_timeout_ns.?) {
+                        min_timeout_ns = effective_timeout;
+                    }
+                },
+                .FD_READ, .FD_WRITE => {
+                    has_fd_subscriptions = true;
+                },
+            }
+        }
+
+        // If we have FD subscriptions, we need to poll them
+        // For now, implement a simpler version that handles the common case:
+        // - Clock subscriptions trigger immediately after timeout
+        // - FD subscriptions for stdio are handled specially
+
+        if (has_fd_subscriptions) {
+            // Build poll file descriptors
+            var poll_fds: [64]std.posix.pollfd = undefined;
+            var poll_count: usize = 0;
+            var fd_to_sub: [64]u32 = undefined;
+
+            for (0..nsubscriptions) |i| {
+                const sub_offset = in_ptr + @as(u32, @intCast(i)) * subscription_size;
+                const tag_byte = try self.memory.readInt(u8, sub_offset + 8);
+                const tag: EventType = @enumFromInt(tag_byte);
+
+                if (tag == .FD_READ or tag == .FD_WRITE) {
+                    // FD is at offset 16 in the union
+                    const wasi_fd = try self.memory.readInt(i32, sub_offset + 16);
+
+                    // Map WASI fd to host fd
+                    const host_fd: std.posix.fd_t = switch (wasi_fd) {
+                        0 => std.io.getStdIn().handle,
+                        1 => std.io.getStdOut().handle,
+                        2 => std.io.getStdErr().handle,
+                        else => blk: {
+                            if (self.context.file_table.get(@intCast(wasi_fd))) |file| {
+                                break :blk file.handle;
+                            }
+                            continue; // Skip invalid FDs
+                        },
+                    };
+
+                    if (poll_count < poll_fds.len) {
+                        poll_fds[poll_count] = .{
+                            .fd = host_fd,
+                            .events = if (tag == .FD_READ) std.posix.POLL.IN else std.posix.POLL.OUT,
+                            .revents = 0,
+                        };
+                        fd_to_sub[poll_count] = @intCast(i);
+                        poll_count += 1;
+                    }
+                }
+            }
+
+            // Calculate poll timeout in milliseconds
+            const timeout_ms: i32 = if (min_timeout_ns) |ns|
+                @intCast(@min(ns / 1_000_000, std.math.maxInt(i32)))
+            else
+                -1; // Infinite timeout
+
+            // Perform the poll
+            if (poll_count > 0) {
+                const poll_result = std.posix.poll(poll_fds[0..poll_count], timeout_ms);
+
+                // Process poll results
+                for (0..poll_count) |pi| {
+                    const revents = poll_fds[pi].revents;
+                    if (revents != 0) {
+                        const sub_idx = fd_to_sub[pi];
+                        const sub_offset = in_ptr + sub_idx * subscription_size;
+                        const userdata = try self.memory.readInt(u64, sub_offset);
+                        const tag_byte = try self.memory.readInt(u8, sub_offset + 8);
+
+                        // Write event
+                        const event_offset = out_ptr + nevents * event_size;
+                        try self.memory.writeInt(u64, event_offset, userdata);
+                        try self.memory.writeInt(u16, event_offset + 8, 0); // error = SUCCESS
+                        try self.memory.writeInt(u8, event_offset + 10, tag_byte); // type
+                        try self.memory.writeInt(u8, event_offset + 11, 0); // padding
+
+                        // fd_readwrite data
+                        try self.memory.writeInt(u64, event_offset + 16, 0); // nbytes (unknown)
+                        const hangup: u16 = if ((revents & std.posix.POLL.HUP) != 0) 1 else 0;
+                        try self.memory.writeInt(u16, event_offset + 24, hangup);
+
+                        nevents += 1;
+                    }
+                }
+
+                // If poll returned due to timeout and we have clock subscriptions, fire them
+                if (poll_result == 0 and min_timeout_ns != null) {
+                    for (0..nsubscriptions) |i| {
+                        const sub_offset = in_ptr + @as(u32, @intCast(i)) * subscription_size;
+                        const tag_byte = try self.memory.readInt(u8, sub_offset + 8);
+
+                        if (tag_byte == @intFromEnum(EventType.CLOCK)) {
+                            const userdata = try self.memory.readInt(u64, sub_offset);
+
+                            const event_offset = out_ptr + nevents * event_size;
+                            try self.memory.writeInt(u64, event_offset, userdata);
+                            try self.memory.writeInt(u16, event_offset + 8, 0); // error
+                            try self.memory.writeInt(u8, event_offset + 10, @intFromEnum(EventType.CLOCK));
+                            try self.memory.writeInt(u8, event_offset + 11, 0);
+                            // Zero out fd_readwrite for clock events
+                            try self.memory.writeInt(u64, event_offset + 16, 0);
+                            try self.memory.writeInt(u16, event_offset + 24, 0);
+
+                            nevents += 1;
+                            break; // Only fire one clock event
+                        }
+                    }
+                }
+            }
+        } else if (min_timeout_ns) |timeout_ns| {
+            // Only clock subscriptions - just sleep and fire them
+            if (timeout_ns > 0) {
+                std.time.sleep(timeout_ns);
+            }
+
+            // Fire all clock events
+            for (0..nsubscriptions) |i| {
+                const sub_offset = in_ptr + @as(u32, @intCast(i)) * subscription_size;
+                const tag_byte = try self.memory.readInt(u8, sub_offset + 8);
+
+                if (tag_byte == @intFromEnum(EventType.CLOCK)) {
+                    const userdata = try self.memory.readInt(u64, sub_offset);
+
+                    const event_offset = out_ptr + nevents * event_size;
+                    try self.memory.writeInt(u64, event_offset, userdata);
+                    try self.memory.writeInt(u16, event_offset + 8, 0); // error = SUCCESS
+                    try self.memory.writeInt(u8, event_offset + 10, @intFromEnum(EventType.CLOCK));
+                    try self.memory.writeInt(u8, event_offset + 11, 0); // padding
+                    try self.memory.writeInt(u64, event_offset + 16, 0); // nbytes
+                    try self.memory.writeInt(u16, event_offset + 24, 0); // flags
+
+                    nevents += 1;
+                }
+            }
+        }
+
+        try self.memory.writeInt(u32, nevents_ptr, nevents);
         return .SUCCESS;
     }
 

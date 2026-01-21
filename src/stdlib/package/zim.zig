@@ -240,6 +240,18 @@ pub const Manifest = struct {
         self.dev_dependencies.deinit();
     }
 
+    /// JSON structure for nexus.json manifest parsing
+    const ManifestJson = struct {
+        name: []const u8,
+        version: []const u8,
+        description: ?[]const u8 = null,
+        author: ?[]const u8 = null,
+        license: ?[]const u8 = null,
+        main: ?[]const u8 = null,
+        dependencies: ?std.json.ObjectMap = null,
+        devDependencies: ?std.json.ObjectMap = null,
+    };
+
     /// Load manifest from nexus.json
     pub fn load(allocator: std.mem.Allocator, path: []const u8) !Manifest {
         const file = try std.fs.cwd().openFile(path, .{});
@@ -248,8 +260,54 @@ pub const Manifest = struct {
         const content = try file.readToEndAlloc(allocator, 1024 * 1024); // 1MB max
         defer allocator.free(content);
 
-        // Parse JSON (simplified - would use std.json in real implementation)
-        const manifest = Manifest.init(allocator, "unknown", "0.0.0");
+        // Parse JSON using std.json
+        const parsed = std.json.parseFromSlice(ManifestJson, allocator, content, .{
+            .ignore_unknown_fields = true,
+        }) catch return error.InvalidManifest;
+        defer parsed.deinit();
+
+        const v = parsed.value;
+
+        // Create manifest with parsed values
+        var manifest = Manifest{
+            .name = try allocator.dupe(u8, v.name),
+            .version = try allocator.dupe(u8, v.version),
+            .description = if (v.description) |d| try allocator.dupe(u8, d) else null,
+            .author = if (v.author) |a| try allocator.dupe(u8, a) else null,
+            .license = if (v.license) |l| try allocator.dupe(u8, l) else null,
+            .main = if (v.main) |m| try allocator.dupe(u8, m) else "src/main.zig",
+            .dependencies = std.StringHashMap([]const u8).init(allocator),
+            .dev_dependencies = std.StringHashMap([]const u8).init(allocator),
+            .allocator = allocator,
+        };
+
+        // Parse dependencies
+        if (v.dependencies) |deps| {
+            var it = deps.iterator();
+            while (it.next()) |entry| {
+                const key = try allocator.dupe(u8, entry.key_ptr.*);
+                errdefer allocator.free(key);
+                const value = switch (entry.value_ptr.*) {
+                    .string => |s| try allocator.dupe(u8, s),
+                    else => continue,
+                };
+                try manifest.dependencies.put(key, value);
+            }
+        }
+
+        // Parse devDependencies
+        if (v.devDependencies) |deps| {
+            var it = deps.iterator();
+            while (it.next()) |entry| {
+                const key = try allocator.dupe(u8, entry.key_ptr.*);
+                errdefer allocator.free(key);
+                const value = switch (entry.value_ptr.*) {
+                    .string => |s| try allocator.dupe(u8, s),
+                    else => continue,
+                };
+                try manifest.dev_dependencies.put(key, value);
+            }
+        }
 
         std.debug.print("✓ Loaded manifest from {s}\n", .{path});
 

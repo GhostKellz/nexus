@@ -2,6 +2,179 @@ const std = @import("std");
 const http = @import("http.zig");
 const fs = @import("../fs/file.zig");
 
+/// HTTP date parsing for conditional requests
+/// Supports RFC 1123, RFC 850, and ANSI C asctime() formats
+pub const HttpDate = struct {
+    /// Month name to number mapping
+    const months = [_][]const u8{
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    };
+
+    /// Parse month name to 1-indexed month number
+    fn parseMonth(name: []const u8) ?u4 {
+        for (months, 0..) |m, i| {
+            if (std.mem.eql(u8, name, m)) {
+                return @intCast(i + 1);
+            }
+        }
+        return null;
+    }
+
+    /// Parse HTTP date string to Unix timestamp (seconds since epoch)
+    /// Supports:
+    /// - RFC 1123: "Sun, 06 Nov 1994 08:49:37 GMT"
+    /// - RFC 850:  "Sunday, 06-Nov-94 08:49:37 GMT"
+    /// - asctime:  "Sun Nov  6 08:49:37 1994"
+    pub fn parse(date_str: []const u8) ?i64 {
+        // Try RFC 1123 first (most common): "Sun, 06 Nov 1994 08:49:37 GMT"
+        if (parseRfc1123(date_str)) |ts| return ts;
+
+        // Try RFC 850: "Sunday, 06-Nov-94 08:49:37 GMT"
+        if (parseRfc850(date_str)) |ts| return ts;
+
+        // Try asctime: "Sun Nov  6 08:49:37 1994"
+        if (parseAsctime(date_str)) |ts| return ts;
+
+        return null;
+    }
+
+    /// Parse RFC 1123 date: "Sun, 06 Nov 1994 08:49:37 GMT"
+    fn parseRfc1123(date_str: []const u8) ?i64 {
+        // Skip day name and comma
+        const after_comma = std.mem.indexOf(u8, date_str, ", ") orelse return null;
+        const rest = date_str[after_comma + 2 ..];
+
+        // Parse: "06 Nov 1994 08:49:37 GMT"
+        if (rest.len < 20) return null;
+
+        const day = std.fmt.parseInt(u5, rest[0..2], 10) catch return null;
+        const month = parseMonth(rest[3..6]) orelse return null;
+        const year = std.fmt.parseInt(u16, rest[7..11], 10) catch return null;
+        const hour = std.fmt.parseInt(u5, rest[12..14], 10) catch return null;
+        const minute = std.fmt.parseInt(u6, rest[15..17], 10) catch return null;
+        const second = std.fmt.parseInt(u6, rest[18..20], 10) catch return null;
+
+        return toUnixTimestamp(year, month, day, hour, minute, second);
+    }
+
+    /// Parse RFC 850 date: "Sunday, 06-Nov-94 08:49:37 GMT"
+    fn parseRfc850(date_str: []const u8) ?i64 {
+        // Skip day name and comma
+        const after_comma = std.mem.indexOf(u8, date_str, ", ") orelse return null;
+        const rest = date_str[after_comma + 2 ..];
+
+        // Parse: "06-Nov-94 08:49:37 GMT"
+        if (rest.len < 18) return null;
+
+        const day = std.fmt.parseInt(u5, rest[0..2], 10) catch return null;
+        const month = parseMonth(rest[3..6]) orelse return null;
+        var year = std.fmt.parseInt(u16, rest[7..9], 10) catch return null;
+
+        // Convert 2-digit year: 00-69 = 2000-2069, 70-99 = 1970-1999
+        if (year < 70) {
+            year += 2000;
+        } else {
+            year += 1900;
+        }
+
+        const hour = std.fmt.parseInt(u5, rest[10..12], 10) catch return null;
+        const minute = std.fmt.parseInt(u6, rest[13..15], 10) catch return null;
+        const second = std.fmt.parseInt(u6, rest[16..18], 10) catch return null;
+
+        return toUnixTimestamp(year, month, day, hour, minute, second);
+    }
+
+    /// Parse asctime date: "Sun Nov  6 08:49:37 1994"
+    fn parseAsctime(date_str: []const u8) ?i64 {
+        if (date_str.len < 24) return null;
+
+        const month = parseMonth(date_str[4..7]) orelse return null;
+
+        // Day can be space-padded: " 6" or "06"
+        const day_str = std.mem.trim(u8, date_str[8..10], " ");
+        const day = std.fmt.parseInt(u5, day_str, 10) catch return null;
+
+        const hour = std.fmt.parseInt(u5, date_str[11..13], 10) catch return null;
+        const minute = std.fmt.parseInt(u6, date_str[14..16], 10) catch return null;
+        const second = std.fmt.parseInt(u6, date_str[17..19], 10) catch return null;
+        const year = std.fmt.parseInt(u16, date_str[20..24], 10) catch return null;
+
+        return toUnixTimestamp(year, month, day, hour, minute, second);
+    }
+
+    /// Convert date components to Unix timestamp
+    fn toUnixTimestamp(year: u16, month: u4, day: u5, hour: u5, minute: u6, second: u6) ?i64 {
+        // Use Zig's epoch calculation
+        const epoch_day = epochDay(year, month, day) catch return null;
+        const day_seconds: i64 = @as(i64, epoch_day) * 86400;
+        const time_seconds: i64 = @as(i64, hour) * 3600 + @as(i64, minute) * 60 + @as(i64, second);
+        return day_seconds + time_seconds;
+    }
+
+    /// Calculate days since Unix epoch (1970-01-01)
+    fn epochDay(year: u16, month: u4, day: u5) !i32 {
+        var y: i32 = @intCast(year);
+        var m: i32 = @intCast(month);
+        const d: i32 = @intCast(day);
+
+        // Adjust for months (March = 1)
+        if (m <= 2) {
+            y -= 1;
+            m += 12;
+        }
+        m -= 3;
+
+        // Calculate days
+        const era: i32 = @divFloor(y, 400);
+        const yoe: i32 = @mod(y, 400);
+        const doy: i32 = @divFloor(153 * m + 2, 5) + d - 1;
+        const doe: i32 = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+
+        // Days since epoch (1970-01-01 is day 0)
+        return era * 146097 + doe - 719468;
+    }
+
+    /// Format a Unix timestamp as RFC 1123 date
+    pub fn format(timestamp: i64, buf: []u8) ![]const u8 {
+        const day_names = [_][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+
+        // Calculate date components from timestamp
+        const days_since_epoch: i64 = @divFloor(timestamp, 86400);
+        const time_of_day: u32 = @intCast(@mod(timestamp, 86400));
+
+        const hour: u8 = @intCast(time_of_day / 3600);
+        const minute: u8 = @intCast((time_of_day % 3600) / 60);
+        const second: u8 = @intCast(time_of_day % 60);
+
+        // Day of week (1970-01-01 was Thursday = 4)
+        const dow: usize = @intCast(@mod(days_since_epoch + 4, 7));
+
+        // Calculate year, month, day from days since epoch
+        const z: i64 = days_since_epoch + 719468;
+        const era: i64 = @divFloor(z, 146097);
+        const doe: i64 = @mod(z, 146097);
+        const yoe: i64 = @divFloor(doe - @divFloor(doe, 1460) + @divFloor(doe, 36524) - @divFloor(doe, 146096), 365);
+        const y: i64 = yoe + era * 400;
+        const doy: i64 = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
+        const mp: i64 = @divFloor(5 * doy + 2, 153);
+        const d: u8 = @intCast(doy - @divFloor(153 * mp + 2, 5) + 1);
+        const m_raw: i64 = if (mp < 10) mp + 3 else mp - 9;
+        const m: usize = @intCast(m_raw);
+        const year: u16 = @intCast(if (m <= 2) y + 1 else y);
+
+        return std.fmt.bufPrint(buf, "{s}, {d:0>2} {s} {d} {d:0>2}:{d:0>2}:{d:0>2} GMT", .{
+            day_names[dow],
+            d,
+            months[m - 1],
+            year,
+            hour,
+            minute,
+            second,
+        });
+    }
+};
+
 pub const StaticFileOptions = struct {
     index: ?[]const u8 = "index.html",
     dot_files: bool = false, // Allow serving hidden files
@@ -22,7 +195,7 @@ fn calculateETag(stat: std.fs.File.Stat, allocator: std.mem.Allocator) ![]u8 {
 
 /// Check if client's cached version is still valid
 fn checkNotModified(req: *http.Request, etag: []const u8, last_modified: i64) bool {
-    // Check If-None-Match (ETag)
+    // Check If-None-Match (ETag) - takes precedence
     if (req.getHeader("if-none-match")) |client_etag| {
         if (std.mem.eql(u8, client_etag, etag)) {
             return true;
@@ -31,10 +204,14 @@ fn checkNotModified(req: *http.Request, etag: []const u8, last_modified: i64) bo
 
     // Check If-Modified-Since
     if (req.getHeader("if-modified-since")) |client_date| {
-        _ = client_date;
-        _ = last_modified;
-        // TODO: Parse HTTP date and compare
-        // For now, ETag is sufficient
+        if (HttpDate.parse(client_date)) |client_timestamp| {
+            // Convert last_modified from nanoseconds to seconds
+            const server_timestamp = @divFloor(last_modified, std.time.ns_per_s);
+            // Not modified if client's date is >= server's last modified time
+            if (client_timestamp >= server_timestamp) {
+                return true;
+            }
+        }
     }
 
     return false;

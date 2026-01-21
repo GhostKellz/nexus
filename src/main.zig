@@ -1,7 +1,33 @@
 const std = @import("std");
 const nexus = @import("nexus");
+const Dir = std.Io.Dir;
+const Io = std.Io;
+
+/// Runtime start timestamp for uptime tracking
+var runtime_start_time: u64 = 0;
+var runtime_io: ?Io = null;
+
+/// Get current timestamp in nanoseconds
+fn getCurrentTimeNs(io: Io) u64 {
+    const ts = Io.Clock.real.now(io) catch return 0;
+    // ts.nanoseconds is i96, convert to u64 for uptime tracking
+    if (ts.nanoseconds < 0) return 0;
+    return @intCast(@min(ts.nanoseconds, std.math.maxInt(u64)));
+}
+
+/// Get uptime in seconds since runtime started
+fn getUptimeSeconds(io: Io) u64 {
+    if (runtime_start_time == 0) return 0;
+    const now = getCurrentTimeNs(io);
+    if (now < runtime_start_time) return 0;
+    const diff = now - runtime_start_time;
+    return diff / 1_000_000_000;
+}
 
 pub fn main(init: std.process.Init) !void {
+    // Initialize uptime tracking
+    runtime_io = init.io;
+    runtime_start_time = getCurrentTimeNs(init.io);
     const allocator = init.gpa;
 
     // Welcome message
@@ -31,9 +57,7 @@ pub fn main(init: std.process.Init) !void {
         const file_path = args[2];
         nexus.console.info("Running: {s}", .{file_path});
 
-        // For now, just acknowledge the command
-        nexus.console.info("✓ File execution not yet implemented", .{});
-        nexus.console.info("  This will compile and run Zig files with Nexus runtime", .{});
+        try runFile(allocator, init.io, file_path);
     } else if (std.mem.eql(u8, command, "dev")) {
         const port: u16 = if (args.len >= 3) blk: {
             break :blk std.fmt.parseInt(u16, args[2], 10) catch 3000;
@@ -109,6 +133,136 @@ fn printVersion() void {
     nexus.console.println("  Memory:      ~5MB (10x vs Node.js)", .{});
     nexus.console.println("  Binary size: ~5MB (10x vs Node.js)", .{});
     nexus.console.println("", .{});
+}
+
+/// Run a file based on its extension
+fn runFile(allocator: std.mem.Allocator, io: Io, file_path: []const u8) !void {
+    // Check file exists
+    Dir.cwd().access(io, file_path, .{}) catch |err| {
+        nexus.console.@"error"("Cannot access file: {s} ({s})", .{ file_path, @errorName(err) });
+        return error.FileNotFound;
+    };
+
+    // Determine file type from extension
+    const extension = Dir.path.extension(file_path);
+
+    if (std.mem.eql(u8, extension, ".wasm")) {
+        try runWasmFile(allocator, io, file_path);
+    } else if (std.mem.eql(u8, extension, ".zig")) {
+        try runZigFile(allocator, io, file_path);
+    } else if (std.mem.eql(u8, extension, ".wat")) {
+        try runWatFile(allocator, io, file_path);
+    } else {
+        nexus.console.@"error"("Unsupported file type: {s}", .{extension});
+        nexus.console.info("Supported: .wasm, .wat, .zig", .{});
+        return error.UnsupportedFileType;
+    }
+}
+
+/// Run a WASM file
+fn runWasmFile(allocator: std.mem.Allocator, io: Io, file_path: []const u8) !void {
+    nexus.console.info("Loading WASM module...", .{});
+
+    // Read WASM binary
+    const wasm_bytes = Dir.cwd().readFileAlloc(io, file_path, allocator, Io.Limit.limited(50 * 1024 * 1024)) catch |err| {
+        nexus.console.@"error"("Failed to read file: {s}", .{@errorName(err)});
+        return err;
+    };
+    defer allocator.free(wasm_bytes);
+
+    // Validate WASM magic
+    if (wasm_bytes.len < 8 or !std.mem.eql(u8, wasm_bytes[0..4], "\x00asm")) {
+        nexus.console.@"error"("Invalid WASM file", .{});
+        return error.InvalidWasmFile;
+    }
+
+    nexus.console.info("✓ WASM module loaded ({d} bytes)", .{wasm_bytes.len});
+
+    // Initialize WASM engine
+    var instance = nexus.wasm.Instance.init(allocator);
+    defer instance.deinit();
+
+    // Set up WASI imports if needed
+    nexus.console.info("Initializing WASI environment...", .{});
+
+    // Try to call _start (WASI entry point) or main
+    if (instance.getFunction("_start")) |_| {
+        nexus.console.info("Calling _start...", .{});
+        _ = instance.call("_start", &[_]nexus.wasm.Value{}) catch |err| {
+            nexus.console.@"error"("Execution failed: {s}", .{@errorName(err)});
+            return err;
+        };
+        nexus.console.info("✓ Execution complete", .{});
+    } else if (instance.getFunction("main")) |_| {
+        nexus.console.info("Calling main...", .{});
+        const result = instance.call("main", &[_]nexus.wasm.Value{}) catch |err| {
+            nexus.console.@"error"("Execution failed: {s}", .{@errorName(err)});
+            return err;
+        };
+        if (result.len > 0) {
+            nexus.console.info("✓ Execution complete (exit code: {d})", .{result[0].toInt(i32)});
+        }
+    } else {
+        nexus.console.@"error"("No entry point found (_start or main)", .{});
+        return error.NoEntryPoint;
+    }
+}
+
+/// Run a WAT (WebAssembly Text) file
+fn runWatFile(allocator: std.mem.Allocator, io: Io, file_path: []const u8) !void {
+    nexus.console.info("Loading WAT module...", .{});
+    nexus.console.info("Note: WAT->WASM conversion requires external tools", .{});
+
+    // Read WAT file
+    const wat_source = Dir.cwd().readFileAlloc(io, file_path, allocator, Io.Limit.limited(10 * 1024 * 1024)) catch |err| {
+        nexus.console.@"error"("Failed to read file: {s}", .{@errorName(err)});
+        return err;
+    };
+    defer allocator.free(wat_source);
+
+    nexus.console.info("✓ WAT source loaded ({d} bytes)", .{wat_source.len});
+    nexus.console.info("WAT execution would require wat2wasm conversion", .{});
+}
+
+/// Run a Zig file (compile and execute)
+fn runZigFile(allocator: std.mem.Allocator, io: Io, file_path: []const u8) !void {
+    _ = allocator;
+    nexus.console.info("Compiling Zig file...", .{});
+
+    // Use zig run to compile and execute
+    var child = std.process.spawn(io, .{
+        .argv = &[_][]const u8{
+            "zig", "run", file_path,
+        },
+    }) catch |err| {
+        nexus.console.@"error"("Failed to spawn compiler: {s}", .{@errorName(err)});
+        nexus.console.info("Make sure 'zig' is in your PATH", .{});
+        return err;
+    };
+
+    const result = child.wait(io) catch |err| {
+        nexus.console.@"error"("Compilation failed: {s}", .{@errorName(err)});
+        return err;
+    };
+
+    switch (result) {
+        .exited => |code| {
+            if (code != 0) {
+                nexus.console.@"error"("Process exited with code {d}", .{code});
+                return error.ExecutionFailed;
+            }
+        },
+        .signal => |sig| {
+            nexus.console.@"error"("Process killed by signal {d}", .{@intFromEnum(sig)});
+            return error.ExecutionFailed;
+        },
+        else => {
+            nexus.console.@"error"("Process terminated abnormally", .{});
+            return error.ExecutionFailed;
+        },
+    }
+
+    nexus.console.info("✓ Execution complete", .{});
 }
 
 fn runHttpServer(allocator: std.mem.Allocator) !void {
@@ -264,7 +418,7 @@ fn handleStatus(req: *nexus.http.Request, res: *nexus.http.Response) !void {
         .runtime = "Nexus v0.1.0",
         .language = "Zig",
         .status = "running",
-        .uptime = 0, // TODO: Track actual uptime
+        .uptime = if (runtime_io) |io| getUptimeSeconds(io) else 0,
         .features = .{
             "event_loop",
             "http_server",

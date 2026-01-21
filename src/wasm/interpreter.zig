@@ -179,25 +179,91 @@ pub const LocalsFrame = struct {
     }
 };
 
+/// Control frame for blocks/loops/ifs
+pub const ControlFrame = struct {
+    opcode: Opcode, // block, loop, or if_
+    start_pc: usize, // Start of block (for loops)
+    end_pc: usize, // End of block
+    stack_height: usize, // Stack height when entering block
+    else_pc: ?usize, // Location of else branch (for if)
+};
+
 /// WASM bytecode interpreter
 pub const Interpreter = struct {
     stack: Stack,
     locals: LocalsFrame,
+    control_stack: std.ArrayListUnmanaged(ControlFrame),
     instance: *engine.Instance,
     allocator: std.mem.Allocator,
+    globals: std.ArrayListUnmanaged(engine.Value),
 
     pub fn init(allocator: std.mem.Allocator, instance: *engine.Instance, local_count: usize) !Interpreter {
         return Interpreter{
             .stack = Stack.init(allocator),
             .locals = try LocalsFrame.init(allocator, local_count),
+            .control_stack = .{},
             .instance = instance,
             .allocator = allocator,
+            .globals = .{},
         };
     }
 
     pub fn deinit(self: *Interpreter) void {
         self.stack.deinit();
         self.locals.deinit();
+        self.control_stack.deinit(self.allocator);
+        self.globals.deinit(self.allocator);
+    }
+
+    pub fn setGlobal(self: *Interpreter, index: u32, value: engine.Value) !void {
+        while (self.globals.items.len <= index) {
+            try self.globals.append(self.allocator, engine.Value{ .i32 = 0 });
+        }
+        self.globals.items[index] = value;
+    }
+
+    pub fn getGlobal(self: *Interpreter, index: u32) !engine.Value {
+        if (index >= self.globals.items.len) return error.InvalidGlobalIndex;
+        return self.globals.items[index];
+    }
+
+    /// Find the end of a block/loop/if structure
+    fn findBlockEnd(code: []const u8, start: usize) !usize {
+        var pc = start;
+        var depth: usize = 1;
+        while (pc < code.len and depth > 0) {
+            const op = code[pc];
+            pc += 1;
+            switch (op) {
+                0x02, 0x03, 0x04 => { // block, loop, if
+                    _ = try readLEB128(i32, code, &pc); // block type
+                    depth += 1;
+                },
+                0x05 => {}, // else - same depth
+                0x0B => depth -= 1, // end
+                0x0C, 0x0D => _ = try readLEB128(u32, code, &pc), // br, br_if
+                0x0E => { // br_table
+                    const count = try readLEB128(u32, code, &pc);
+                    var i: u32 = 0;
+                    while (i <= count) : (i += 1) {
+                        _ = try readLEB128(u32, code, &pc);
+                    }
+                },
+                0x10, 0x11 => _ = try readLEB128(u32, code, &pc), // call, call_indirect
+                0x20, 0x21, 0x22, 0x23, 0x24 => _ = try readLEB128(u32, code, &pc), // local/global ops
+                0x28...0x3E => { // memory ops
+                    _ = try readLEB128(u32, code, &pc);
+                    _ = try readLEB128(u32, code, &pc);
+                },
+                0x3F, 0x40 => _ = try readLEB128(u32, code, &pc), // memory.size, memory.grow
+                0x41 => _ = try readLEB128(i32, code, &pc), // i32.const
+                0x42 => _ = try readLEB128(i64, code, &pc), // i64.const
+                0x43 => pc += 4, // f32.const
+                0x44 => pc += 8, // f64.const
+                else => {},
+            }
+        }
+        return pc;
     }
 
     /// Execute WASM bytecode
@@ -209,8 +275,169 @@ pub const Interpreter = struct {
             pc += 1;
 
             switch (opcode) {
-                // Nop
+                // Control flow basics
+                .unreachable_ => return error.Unreachable,
                 .nop => {},
+
+                // Structured control flow
+                .block => {
+                    _ = try readLEB128(i32, code, &pc); // block type
+                    const end_pc = try findBlockEnd(code, pc);
+                    try self.control_stack.append(self.allocator, ControlFrame{
+                        .opcode = .block,
+                        .start_pc = pc,
+                        .end_pc = end_pc,
+                        .stack_height = self.stack.size(),
+                        .else_pc = null,
+                    });
+                },
+                .loop => {
+                    _ = try readLEB128(i32, code, &pc); // block type
+                    const start_pc = pc;
+                    const end_pc = try findBlockEnd(code, pc);
+                    try self.control_stack.append(self.allocator, ControlFrame{
+                        .opcode = .loop,
+                        .start_pc = start_pc,
+                        .end_pc = end_pc,
+                        .stack_height = self.stack.size(),
+                        .else_pc = null,
+                    });
+                },
+                .if_ => {
+                    _ = try readLEB128(i32, code, &pc); // block type
+                    const condition = try self.stack.pop();
+                    const end_pc = try findBlockEnd(code, pc);
+
+                    if (condition.i32 != 0) {
+                        // Execute if branch
+                        try self.control_stack.append(self.allocator, ControlFrame{
+                            .opcode = .if_,
+                            .start_pc = pc,
+                            .end_pc = end_pc,
+                            .stack_height = self.stack.size(),
+                            .else_pc = null,
+                        });
+                    } else {
+                        // Skip to else or end
+                        var depth: usize = 1;
+                        while (pc < code.len and depth > 0) {
+                            const op = code[pc];
+                            pc += 1;
+                            if (op == 0x04) { // if
+                                _ = try readLEB128(i32, code, &pc);
+                                depth += 1;
+                            } else if (op == 0x05 and depth == 1) { // else at our level
+                                try self.control_stack.append(self.allocator, ControlFrame{
+                                    .opcode = .if_,
+                                    .start_pc = pc,
+                                    .end_pc = end_pc,
+                                    .stack_height = self.stack.size(),
+                                    .else_pc = null,
+                                });
+                                break;
+                            } else if (op == 0x0B) { // end
+                                depth -= 1;
+                            }
+                        }
+                    }
+                },
+                .else_ => {
+                    // Skip to end of if block
+                    if (self.control_stack.items.len > 0) {
+                        const frame = self.control_stack.pop().?;
+                        pc = frame.end_pc;
+                    }
+                },
+                .end => {
+                    if (self.control_stack.items.len > 0) {
+                        _ = self.control_stack.pop();
+                    } else {
+                        break; // End of function
+                    }
+                },
+                .br => {
+                    const depth = try readLEB128(u32, code, &pc);
+                    if (depth >= self.control_stack.items.len) {
+                        break; // Branch out of function
+                    }
+                    const target_idx = self.control_stack.items.len - 1 - depth;
+                    const frame = self.control_stack.items[target_idx];
+                    if (frame.opcode == .loop) {
+                        pc = frame.start_pc; // Jump to loop start
+                    } else {
+                        pc = frame.end_pc; // Jump to block end
+                        // Pop frames up to and including target
+                        self.control_stack.shrinkRetainingCapacity(target_idx);
+                    }
+                },
+                .br_if => {
+                    const depth = try readLEB128(u32, code, &pc);
+                    const condition = try self.stack.pop();
+                    if (condition.i32 != 0) {
+                        if (depth >= self.control_stack.items.len) {
+                            break;
+                        }
+                        const target_idx = self.control_stack.items.len - 1 - depth;
+                        const frame = self.control_stack.items[target_idx];
+                        if (frame.opcode == .loop) {
+                            pc = frame.start_pc;
+                        } else {
+                            pc = frame.end_pc;
+                            self.control_stack.shrinkRetainingCapacity(target_idx);
+                        }
+                    }
+                },
+                .br_table => {
+                    const count = try readLEB128(u32, code, &pc);
+                    var targets: std.ArrayList(u32) = .{};
+                    defer targets.deinit(self.allocator);
+                    var i: u32 = 0;
+                    while (i <= count) : (i += 1) {
+                        try targets.append(self.allocator, try readLEB128(u32, code, &pc));
+                    }
+                    const index = try self.stack.pop();
+                    const depth = if (@as(u32, @bitCast(index.i32)) < count)
+                        targets.items[@intCast(@as(u32, @bitCast(index.i32)))]
+                    else
+                        targets.items[count]; // default
+
+                    if (depth >= self.control_stack.items.len) {
+                        break;
+                    }
+                    const target_idx = self.control_stack.items.len - 1 - depth;
+                    const frame = self.control_stack.items[target_idx];
+                    if (frame.opcode == .loop) {
+                        pc = frame.start_pc;
+                    } else {
+                        pc = frame.end_pc;
+                        self.control_stack.shrinkRetainingCapacity(target_idx);
+                    }
+                },
+                .return_ => break,
+                .call => {
+                    const func_idx = try readLEB128(u32, code, &pc);
+                    // Function calls would require full function table support
+                    // For now, log the call
+                    std.debug.print("WASM call to function {d}\n", .{func_idx});
+                },
+                .call_indirect => {
+                    const type_idx = try readLEB128(u32, code, &pc);
+                    const table_idx = try readLEB128(u32, code, &pc);
+                    const func_idx = try self.stack.pop();
+                    std.debug.print("WASM call_indirect type={d} table={d} func={d}\n", .{ type_idx, table_idx, func_idx.i32 });
+                },
+
+                // Global variables
+                .global_get => {
+                    const index = try readLEB128(u32, code, &pc);
+                    const value = try self.getGlobal(index);
+                    try self.stack.push(value);
+                },
+                .global_set => {
+                    const index = try readLEB128(u32, code, &pc);
+                    const value = try self.stack.pop();
+                    try self.setGlobal(index, value);
+                },
 
                 // Constants
                 .i32_const => {
@@ -220,6 +447,18 @@ pub const Interpreter = struct {
                 .i64_const => {
                     const value = try readLEB128(i64, code, &pc);
                     try self.stack.push(engine.Value{ .i64 = value });
+                },
+                .f32_const => {
+                    if (pc + 4 > code.len) return error.UnexpectedEnd;
+                    const bits = std.mem.readInt(u32, code[pc..][0..4], .little);
+                    pc += 4;
+                    try self.stack.push(engine.Value{ .f32 = @bitCast(bits) });
+                },
+                .f64_const => {
+                    if (pc + 8 > code.len) return error.UnexpectedEnd;
+                    const bits = std.mem.readInt(u64, code[pc..][0..8], .little);
+                    pc += 8;
+                    try self.stack.push(engine.Value{ .f64 = @bitCast(bits) });
                 },
 
                 // Local variables
@@ -270,6 +509,20 @@ pub const Interpreter = struct {
                     const result = @divTrunc(au, bu);
                     try self.stack.push(engine.Value{ .i32 = @bitCast(result) });
                 },
+                .i32_rem_s => {
+                    const b = try self.stack.pop();
+                    const a = try self.stack.pop();
+                    if (b.i32 == 0) return error.DivisionByZero;
+                    try self.stack.push(engine.Value{ .i32 = @rem(a.i32, b.i32) });
+                },
+                .i32_rem_u => {
+                    const b = try self.stack.pop();
+                    const a = try self.stack.pop();
+                    const au = @as(u32, @bitCast(a.i32));
+                    const bu = @as(u32, @bitCast(b.i32));
+                    if (bu == 0) return error.DivisionByZero;
+                    try self.stack.push(engine.Value{ .i32 = @bitCast(au % bu) });
+                },
 
                 // i32 bitwise
                 .i32_and => {
@@ -293,6 +546,12 @@ pub const Interpreter = struct {
                     const shift = @as(u5, @intCast(@as(u32, @bitCast(b.i32)) % 32));
                     try self.stack.push(engine.Value{ .i32 = a.i32 << shift });
                 },
+                .i32_shr_s => {
+                    const b = try self.stack.pop();
+                    const a = try self.stack.pop();
+                    const shift = @as(u5, @intCast(@as(u32, @bitCast(b.i32)) % 32));
+                    try self.stack.push(engine.Value{ .i32 = a.i32 >> shift });
+                },
                 .i32_shr_u => {
                     const b = try self.stack.pop();
                     const a = try self.stack.pop();
@@ -300,8 +559,41 @@ pub const Interpreter = struct {
                     const shift = @as(u5, @intCast(@as(u32, @bitCast(b.i32)) % 32));
                     try self.stack.push(engine.Value{ .i32 = @bitCast(au >> shift) });
                 },
+                .i32_rotl => {
+                    const b = try self.stack.pop();
+                    const a = try self.stack.pop();
+                    const au = @as(u32, @bitCast(a.i32));
+                    const rotation = @as(u5, @intCast(@as(u32, @bitCast(b.i32)) % 32));
+                    try self.stack.push(engine.Value{ .i32 = @bitCast(std.math.rotl(u32, au, rotation)) });
+                },
+                .i32_rotr => {
+                    const b = try self.stack.pop();
+                    const a = try self.stack.pop();
+                    const au = @as(u32, @bitCast(a.i32));
+                    const rotation = @as(u5, @intCast(@as(u32, @bitCast(b.i32)) % 32));
+                    try self.stack.push(engine.Value{ .i32 = @bitCast(std.math.rotr(u32, au, rotation)) });
+                },
+                .i32_clz => {
+                    const a = try self.stack.pop();
+                    const au = @as(u32, @bitCast(a.i32));
+                    try self.stack.push(engine.Value{ .i32 = @intCast(@clz(au)) });
+                },
+                .i32_ctz => {
+                    const a = try self.stack.pop();
+                    const au = @as(u32, @bitCast(a.i32));
+                    try self.stack.push(engine.Value{ .i32 = @intCast(@ctz(au)) });
+                },
+                .i32_popcnt => {
+                    const a = try self.stack.pop();
+                    const au = @as(u32, @bitCast(a.i32));
+                    try self.stack.push(engine.Value{ .i32 = @intCast(@popCount(au)) });
+                },
 
                 // i32 comparisons
+                .i32_eqz => {
+                    const a = try self.stack.pop();
+                    try self.stack.push(engine.Value{ .i32 = if (a.i32 == 0) 1 else 0 });
+                },
                 .i32_eq => {
                     const b = try self.stack.pop();
                     const a = try self.stack.pop();
@@ -317,20 +609,54 @@ pub const Interpreter = struct {
                     const a = try self.stack.pop();
                     try self.stack.push(engine.Value{ .i32 = if (a.i32 < b.i32) 1 else 0 });
                 },
+                .i32_lt_u => {
+                    const b = try self.stack.pop();
+                    const a = try self.stack.pop();
+                    const au = @as(u32, @bitCast(a.i32));
+                    const bu = @as(u32, @bitCast(b.i32));
+                    try self.stack.push(engine.Value{ .i32 = if (au < bu) 1 else 0 });
+                },
                 .i32_gt_s => {
                     const b = try self.stack.pop();
                     const a = try self.stack.pop();
                     try self.stack.push(engine.Value{ .i32 = if (a.i32 > b.i32) 1 else 0 });
+                },
+                .i32_gt_u => {
+                    const b = try self.stack.pop();
+                    const a = try self.stack.pop();
+                    const au = @as(u32, @bitCast(a.i32));
+                    const bu = @as(u32, @bitCast(b.i32));
+                    try self.stack.push(engine.Value{ .i32 = if (au > bu) 1 else 0 });
                 },
                 .i32_le_s => {
                     const b = try self.stack.pop();
                     const a = try self.stack.pop();
                     try self.stack.push(engine.Value{ .i32 = if (a.i32 <= b.i32) 1 else 0 });
                 },
+                .i32_le_u => {
+                    const b = try self.stack.pop();
+                    const a = try self.stack.pop();
+                    const au = @as(u32, @bitCast(a.i32));
+                    const bu = @as(u32, @bitCast(b.i32));
+                    try self.stack.push(engine.Value{ .i32 = if (au <= bu) 1 else 0 });
+                },
                 .i32_ge_s => {
                     const b = try self.stack.pop();
                     const a = try self.stack.pop();
                     try self.stack.push(engine.Value{ .i32 = if (a.i32 >= b.i32) 1 else 0 });
+                },
+                .i32_ge_u => {
+                    const b = try self.stack.pop();
+                    const a = try self.stack.pop();
+                    const au = @as(u32, @bitCast(a.i32));
+                    const bu = @as(u32, @bitCast(b.i32));
+                    try self.stack.push(engine.Value{ .i32 = if (au >= bu) 1 else 0 });
+                },
+
+                // i64 comparisons
+                .i64_eqz => {
+                    const a = try self.stack.pop();
+                    try self.stack.push(engine.Value{ .i32 = if (a.i64 == 0) 1 else 0 });
                 },
 
                 // i64 operations
@@ -359,6 +685,110 @@ pub const Interpreter = struct {
                     const value = try memory.readInt(i32, @intCast(addr.i32 + @as(i32, @intCast(offset))));
                     try self.stack.push(engine.Value{ .i32 = value });
                 },
+                .i64_load => {
+                    const memory = self.instance.getMemory() orelse return error.NoMemory;
+                    _ = try readLEB128(u32, code, &pc); // alignment
+                    const offset = try readLEB128(u32, code, &pc);
+                    const addr = try self.stack.pop();
+                    const value = try memory.readInt(i64, @intCast(addr.i32 + @as(i32, @intCast(offset))));
+                    try self.stack.push(engine.Value{ .i64 = value });
+                },
+                .f32_load => {
+                    const memory = self.instance.getMemory() orelse return error.NoMemory;
+                    _ = try readLEB128(u32, code, &pc); // alignment
+                    const offset = try readLEB128(u32, code, &pc);
+                    const addr = try self.stack.pop();
+                    const bits = try memory.readInt(u32, @intCast(addr.i32 + @as(i32, @intCast(offset))));
+                    try self.stack.push(engine.Value{ .f32 = @bitCast(bits) });
+                },
+                .f64_load => {
+                    const memory = self.instance.getMemory() orelse return error.NoMemory;
+                    _ = try readLEB128(u32, code, &pc); // alignment
+                    const offset = try readLEB128(u32, code, &pc);
+                    const addr = try self.stack.pop();
+                    const bits = try memory.readInt(u64, @intCast(addr.i32 + @as(i32, @intCast(offset))));
+                    try self.stack.push(engine.Value{ .f64 = @bitCast(bits) });
+                },
+                .i32_load8_s => {
+                    const memory = self.instance.getMemory() orelse return error.NoMemory;
+                    _ = try readLEB128(u32, code, &pc); // alignment
+                    const offset = try readLEB128(u32, code, &pc);
+                    const addr = try self.stack.pop();
+                    const value = try memory.readInt(i8, @intCast(addr.i32 + @as(i32, @intCast(offset))));
+                    try self.stack.push(engine.Value{ .i32 = @as(i32, value) });
+                },
+                .i32_load8_u => {
+                    const memory = self.instance.getMemory() orelse return error.NoMemory;
+                    _ = try readLEB128(u32, code, &pc); // alignment
+                    const offset = try readLEB128(u32, code, &pc);
+                    const addr = try self.stack.pop();
+                    const value = try memory.readInt(u8, @intCast(addr.i32 + @as(i32, @intCast(offset))));
+                    try self.stack.push(engine.Value{ .i32 = @as(i32, value) });
+                },
+                .i32_load16_s => {
+                    const memory = self.instance.getMemory() orelse return error.NoMemory;
+                    _ = try readLEB128(u32, code, &pc); // alignment
+                    const offset = try readLEB128(u32, code, &pc);
+                    const addr = try self.stack.pop();
+                    const value = try memory.readInt(i16, @intCast(addr.i32 + @as(i32, @intCast(offset))));
+                    try self.stack.push(engine.Value{ .i32 = @as(i32, value) });
+                },
+                .i32_load16_u => {
+                    const memory = self.instance.getMemory() orelse return error.NoMemory;
+                    _ = try readLEB128(u32, code, &pc); // alignment
+                    const offset = try readLEB128(u32, code, &pc);
+                    const addr = try self.stack.pop();
+                    const value = try memory.readInt(u16, @intCast(addr.i32 + @as(i32, @intCast(offset))));
+                    try self.stack.push(engine.Value{ .i32 = @as(i32, value) });
+                },
+                .i64_load8_s => {
+                    const memory = self.instance.getMemory() orelse return error.NoMemory;
+                    _ = try readLEB128(u32, code, &pc); // alignment
+                    const offset = try readLEB128(u32, code, &pc);
+                    const addr = try self.stack.pop();
+                    const value = try memory.readInt(i8, @intCast(addr.i32 + @as(i32, @intCast(offset))));
+                    try self.stack.push(engine.Value{ .i64 = @as(i64, value) });
+                },
+                .i64_load8_u => {
+                    const memory = self.instance.getMemory() orelse return error.NoMemory;
+                    _ = try readLEB128(u32, code, &pc); // alignment
+                    const offset = try readLEB128(u32, code, &pc);
+                    const addr = try self.stack.pop();
+                    const value = try memory.readInt(u8, @intCast(addr.i32 + @as(i32, @intCast(offset))));
+                    try self.stack.push(engine.Value{ .i64 = @as(i64, value) });
+                },
+                .i64_load16_s => {
+                    const memory = self.instance.getMemory() orelse return error.NoMemory;
+                    _ = try readLEB128(u32, code, &pc); // alignment
+                    const offset = try readLEB128(u32, code, &pc);
+                    const addr = try self.stack.pop();
+                    const value = try memory.readInt(i16, @intCast(addr.i32 + @as(i32, @intCast(offset))));
+                    try self.stack.push(engine.Value{ .i64 = @as(i64, value) });
+                },
+                .i64_load16_u => {
+                    const memory = self.instance.getMemory() orelse return error.NoMemory;
+                    _ = try readLEB128(u32, code, &pc); // alignment
+                    const offset = try readLEB128(u32, code, &pc);
+                    const addr = try self.stack.pop();
+                    const value = try memory.readInt(u16, @intCast(addr.i32 + @as(i32, @intCast(offset))));
+                    try self.stack.push(engine.Value{ .i64 = @as(i64, value) });
+                },
+                .i64_load32_s => {
+                    const memory = self.instance.getMemory() orelse return error.NoMemory;
+                    _ = try readLEB128(u32, code, &pc); // alignment
+                    const offset = try readLEB128(u32, code, &pc);
+                    const addr = try self.stack.pop();
+                    const value = try memory.readInt(i32, @intCast(addr.i32 + @as(i32, @intCast(offset))));
+                    try self.stack.push(engine.Value{ .i64 = @as(i64, value) });
+                },
+                .i64_load32_u => {
+                    const memory = self.instance.getMemory() orelse return error.NoMemory;
+                    _ = try readLEB128(u32, code, &pc); // alignment
+                    const offset = try readLEB128(u32, code, &pc);
+                    const addr = try self.stack.pop();
+                    const value = try memory.readInt(u32, @intCast(addr.i32 + @as(i32, @intCast(offset))));
+                    try self.stack.push(engine.Value{ .i64 = @as(i64, value) });
+                },
                 .i32_store => {
                     const memory = self.instance.getMemory() orelse return error.NoMemory;
                     _ = try readLEB128(u32, code, &pc); // alignment
@@ -367,15 +797,94 @@ pub const Interpreter = struct {
                     const addr = try self.stack.pop();
                     try memory.writeInt(i32, @intCast(addr.i32 + @as(i32, @intCast(offset))), value.i32);
                 },
+                .i64_store => {
+                    const memory = self.instance.getMemory() orelse return error.NoMemory;
+                    _ = try readLEB128(u32, code, &pc); // alignment
+                    const offset = try readLEB128(u32, code, &pc);
+                    const value = try self.stack.pop();
+                    const addr = try self.stack.pop();
+                    try memory.writeInt(i64, @intCast(addr.i32 + @as(i32, @intCast(offset))), value.i64);
+                },
+                .f32_store => {
+                    const memory = self.instance.getMemory() orelse return error.NoMemory;
+                    _ = try readLEB128(u32, code, &pc); // alignment
+                    const offset = try readLEB128(u32, code, &pc);
+                    const value = try self.stack.pop();
+                    try memory.writeInt(u32, @intCast((try self.stack.pop()).i32 + @as(i32, @intCast(offset))), @bitCast(value.f32));
+                },
+                .f64_store => {
+                    const memory = self.instance.getMemory() orelse return error.NoMemory;
+                    _ = try readLEB128(u32, code, &pc); // alignment
+                    const offset = try readLEB128(u32, code, &pc);
+                    const value = try self.stack.pop();
+                    try memory.writeInt(u64, @intCast((try self.stack.pop()).i32 + @as(i32, @intCast(offset))), @bitCast(value.f64));
+                },
+                .i32_store8 => {
+                    const memory = self.instance.getMemory() orelse return error.NoMemory;
+                    _ = try readLEB128(u32, code, &pc); // alignment
+                    const offset = try readLEB128(u32, code, &pc);
+                    const value = try self.stack.pop();
+                    const addr = try self.stack.pop();
+                    try memory.writeInt(u8, @intCast(addr.i32 + @as(i32, @intCast(offset))), @truncate(@as(u32, @bitCast(value.i32))));
+                },
+                .i32_store16 => {
+                    const memory = self.instance.getMemory() orelse return error.NoMemory;
+                    _ = try readLEB128(u32, code, &pc); // alignment
+                    const offset = try readLEB128(u32, code, &pc);
+                    const value = try self.stack.pop();
+                    const addr = try self.stack.pop();
+                    try memory.writeInt(u16, @intCast(addr.i32 + @as(i32, @intCast(offset))), @truncate(@as(u32, @bitCast(value.i32))));
+                },
+                .i64_store8 => {
+                    const memory = self.instance.getMemory() orelse return error.NoMemory;
+                    _ = try readLEB128(u32, code, &pc); // alignment
+                    const offset = try readLEB128(u32, code, &pc);
+                    const value = try self.stack.pop();
+                    const addr = try self.stack.pop();
+                    try memory.writeInt(u8, @intCast(addr.i32 + @as(i32, @intCast(offset))), @truncate(@as(u64, @bitCast(value.i64))));
+                },
+                .i64_store16 => {
+                    const memory = self.instance.getMemory() orelse return error.NoMemory;
+                    _ = try readLEB128(u32, code, &pc); // alignment
+                    const offset = try readLEB128(u32, code, &pc);
+                    const value = try self.stack.pop();
+                    const addr = try self.stack.pop();
+                    try memory.writeInt(u16, @intCast(addr.i32 + @as(i32, @intCast(offset))), @truncate(@as(u64, @bitCast(value.i64))));
+                },
+                .i64_store32 => {
+                    const memory = self.instance.getMemory() orelse return error.NoMemory;
+                    _ = try readLEB128(u32, code, &pc); // alignment
+                    const offset = try readLEB128(u32, code, &pc);
+                    const value = try self.stack.pop();
+                    const addr = try self.stack.pop();
+                    try memory.writeInt(u32, @intCast(addr.i32 + @as(i32, @intCast(offset))), @truncate(@as(u64, @bitCast(value.i64))));
+                },
+                .memory_size => {
+                    const memory = self.instance.getMemory() orelse return error.NoMemory;
+                    _ = try readLEB128(u32, code, &pc); // reserved byte (always 0x00)
+                    try self.stack.push(engine.Value{ .i32 = @intCast(memory.size() / 65536) });
+                },
+                .memory_grow => {
+                    const memory = self.instance.getMemory() orelse return error.NoMemory;
+                    _ = try readLEB128(u32, code, &pc); // reserved byte
+                    const pages = try self.stack.pop();
+                    const old_pages = memory.grow(@intCast(@as(u32, @bitCast(pages.i32)))) catch {
+                        // Memory grow failed, return -1
+                        try self.stack.push(engine.Value{ .i32 = -1 });
+                        continue;
+                    };
+                    try self.stack.push(engine.Value{ .i32 = @intCast(old_pages) });
+                },
 
                 // Stack operations
                 .drop => {
                     _ = try self.stack.pop();
                 },
-
-                // Control flow
-                .end, .return_ => {
-                    break; // End of function
+                .select => {
+                    const c = try self.stack.pop();
+                    const val2 = try self.stack.pop();
+                    const val1 = try self.stack.pop();
+                    try self.stack.push(if (c.i32 != 0) val1 else val2);
                 },
 
                 else => {

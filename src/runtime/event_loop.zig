@@ -343,21 +343,185 @@ const KqueuePoller = struct {
     }
 };
 
-/// Windows IOCP implementation (stub for now)
+/// Windows IOCP implementation
 const IocpPoller = struct {
-    pub fn init(_: std.mem.Allocator) !IocpPoller {
-        return error.NotImplemented;
+    const windows = std.os.windows;
+
+    /// IOCP handle
+    iocp_handle: windows.HANDLE,
+    /// Allocator for events
+    allocator: std.mem.Allocator,
+    /// Registered handles with their associated data
+    registered_handles: std.AutoHashMap(windows.HANDLE, RegisteredHandle),
+    /// Completion entries buffer
+    completion_entries: []windows.OVERLAPPED_ENTRY,
+
+    const RegisteredHandle = struct {
+        handle: windows.HANDLE,
+        events: u32,
+        overlapped_read: *windows.OVERLAPPED,
+        overlapped_write: *windows.OVERLAPPED,
+    };
+
+    const INFINITE: windows.DWORD = 0xFFFFFFFF;
+
+    pub fn init(allocator: std.mem.Allocator) !IocpPoller {
+        // Create I/O completion port with no initial file handle
+        const iocp_handle = windows.kernel32.CreateIoCompletionPort(
+            windows.INVALID_HANDLE_VALUE,
+            null,
+            0,
+            0, // Use default number of concurrent threads
+        );
+
+        if (iocp_handle == null or iocp_handle == windows.INVALID_HANDLE_VALUE) {
+            return error.IocpCreateFailed;
+        }
+
+        const completion_entries = try allocator.alloc(windows.OVERLAPPED_ENTRY, 1024);
+
+        return IocpPoller{
+            .iocp_handle = iocp_handle.?,
+            .allocator = allocator,
+            .registered_handles = std.AutoHashMap(windows.HANDLE, RegisteredHandle).init(allocator),
+            .completion_entries = completion_entries,
+        };
     }
 
-    pub fn deinit(_: *IocpPoller) void {}
-    pub fn register(_: *IocpPoller, _: std.posix.fd_t, _: u32) !void {
-        return error.NotImplemented;
+    pub fn deinit(self: *IocpPoller) void {
+        // Clean up all registered handles
+        var iter = self.registered_handles.iterator();
+        while (iter.next()) |entry| {
+            self.allocator.destroy(entry.value_ptr.overlapped_read);
+            self.allocator.destroy(entry.value_ptr.overlapped_write);
+        }
+        self.registered_handles.deinit();
+
+        self.allocator.free(self.completion_entries);
+
+        if (self.iocp_handle != windows.INVALID_HANDLE_VALUE) {
+            windows.CloseHandle(self.iocp_handle);
+        }
     }
-    pub fn unregister(_: *IocpPoller, _: std.posix.fd_t) !void {
-        return error.NotImplemented;
+
+    pub fn register(self: *IocpPoller, fd: std.posix.fd_t, events: u32) !void {
+        // On Windows, fd_t is a HANDLE
+        const handle: windows.HANDLE = @ptrFromInt(@as(usize, @intCast(fd)));
+
+        // Associate handle with IOCP
+        const result = windows.kernel32.CreateIoCompletionPort(
+            handle,
+            self.iocp_handle,
+            @intFromPtr(handle), // Use handle address as completion key
+            0,
+        );
+
+        if (result == null) {
+            return error.IocpAssociateFailed;
+        }
+
+        // Allocate OVERLAPPED structures for async operations
+        const overlapped_read = try self.allocator.create(windows.OVERLAPPED);
+        const overlapped_write = try self.allocator.create(windows.OVERLAPPED);
+        overlapped_read.* = std.mem.zeroes(windows.OVERLAPPED);
+        overlapped_write.* = std.mem.zeroes(windows.OVERLAPPED);
+
+        try self.registered_handles.put(handle, RegisteredHandle{
+            .handle = handle,
+            .events = events,
+            .overlapped_read = overlapped_read,
+            .overlapped_write = overlapped_write,
+        });
     }
-    pub fn poll(_: *IocpPoller, _: i32) ![]IoEvent {
-        return error.NotImplemented;
+
+    pub fn unregister(self: *IocpPoller, fd: std.posix.fd_t) !void {
+        const handle: windows.HANDLE = @ptrFromInt(@as(usize, @intCast(fd)));
+
+        if (self.registered_handles.fetchRemove(handle)) |kv| {
+            self.allocator.destroy(kv.value.overlapped_read);
+            self.allocator.destroy(kv.value.overlapped_write);
+        }
+        // Note: Cannot disassociate handle from IOCP - it's automatically
+        // removed when the handle is closed
+    }
+
+    pub fn poll(self: *IocpPoller, timeout_ms: i32) ![]IoEvent {
+        const timeout: windows.DWORD = if (timeout_ms < 0)
+            INFINITE
+        else
+            @intCast(timeout_ms);
+
+        var num_entries: windows.ULONG = 0;
+
+        // Get queued completion status entries
+        const success = windows.kernel32.GetQueuedCompletionStatusEx(
+            self.iocp_handle,
+            self.completion_entries.ptr,
+            @intCast(self.completion_entries.len),
+            &num_entries,
+            timeout,
+            windows.FALSE, // Not alertable
+        );
+
+        if (success == windows.FALSE) {
+            const err = windows.kernel32.GetLastError();
+            if (err == windows.Win32Error.WAIT_TIMEOUT) {
+                // Timeout is not an error, just no events
+                return try self.allocator.alloc(IoEvent, 0);
+            }
+            return error.IocpWaitFailed;
+        }
+
+        // Convert completion entries to IoEvents
+        var io_events = try self.allocator.alloc(IoEvent, num_entries);
+        var valid_count: usize = 0;
+
+        for (self.completion_entries[0..num_entries]) |entry| {
+            const handle: windows.HANDLE = @ptrFromInt(entry.lpCompletionKey);
+
+            if (self.registered_handles.get(handle)) |reg| {
+                var event_flags: u32 = 0;
+
+                // Determine event type based on which OVERLAPPED was used
+                if (entry.lpOverlapped == reg.overlapped_read) {
+                    event_flags |= IoEvent.READ;
+                } else if (entry.lpOverlapped == reg.overlapped_write) {
+                    event_flags |= IoEvent.WRITE;
+                }
+
+                // Check for errors
+                if (entry.dwNumberOfBytesTransferred == 0) {
+                    event_flags |= IoEvent.HANGUP;
+                }
+
+                io_events[valid_count] = IoEvent{
+                    .fd = @intCast(@intFromPtr(handle)),
+                    .events = event_flags,
+                    .data = @ptrFromInt(entry.lpCompletionKey),
+                };
+                valid_count += 1;
+            }
+        }
+
+        // Resize to actual valid count
+        if (valid_count < num_entries) {
+            io_events = try self.allocator.realloc(io_events, valid_count);
+        }
+
+        return io_events;
+    }
+
+    /// Post a completion event manually (useful for waking up the loop)
+    pub fn wake(self: *IocpPoller) !void {
+        const success = windows.kernel32.PostQueuedCompletionStatus(
+            self.iocp_handle,
+            0,
+            0,
+            null,
+        );
+        if (success == windows.FALSE) {
+            return error.IocpPostFailed;
+        }
     }
 };
 

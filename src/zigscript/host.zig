@@ -471,14 +471,21 @@ pub fn set_timeout(params: []const Value, allocator: std.mem.Allocator) ![]Value
     const TimerData = struct {
         callback_index: u32,
         instance: *Instance,
+        alloc: std.mem.Allocator,
 
         fn callback(timer: *event_loop.Timer) void {
             const self: *@This() = @ptrCast(@alignCast(timer.data.?));
 
-            // Call WASM function from function table
-            // TODO: Implement function table calls
-            _ = self.callback_index;
-            _ = self.instance;
+            // Call WASM function from function table using indirect call
+            const result = self.instance.callIndirect(self.callback_index, &[_]Value{}) catch |err| {
+                nexus.console.@"error"("Timer callback failed: {}", .{err});
+                return;
+            };
+
+            // Free result if any
+            if (result.len > 0) {
+                self.alloc.free(result);
+            }
         }
     };
 
@@ -486,6 +493,7 @@ pub fn set_timeout(params: []const Value, allocator: std.mem.Allocator) ![]Value
     timer_data.* = .{
         .callback_index = callback_index,
         .instance = ctx.instance,
+        .alloc = allocator,
     };
 
     const timer_id = try ctx.event_loop.setTimeout(delay, TimerData.callback);

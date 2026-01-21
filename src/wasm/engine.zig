@@ -210,12 +210,15 @@ pub const Instance = struct {
     memory: ?*Memory = null,
     functions: std.StringHashMap(*Function),
     globals: std.StringHashMap(Value),
+    /// Function table for indirect calls (call_indirect instruction)
+    function_table: std.ArrayList(*Function),
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) Instance {
         return Instance{
             .functions = std.StringHashMap(*Function).init(allocator),
             .globals = std.StringHashMap(Value).init(allocator),
+            .function_table = .{},
             .allocator = allocator,
         };
     }
@@ -234,6 +237,44 @@ pub const Instance = struct {
         self.functions.deinit();
 
         self.globals.deinit();
+        self.function_table.deinit(self.allocator);
+    }
+
+    /// Add a function to the function table for indirect calls
+    pub fn addToTable(self: *Instance, func: *Function) !u32 {
+        const index: u32 = @intCast(self.function_table.items.len);
+        try self.function_table.append(self.allocator, func);
+        return index;
+    }
+
+    /// Get a function from the table by index
+    pub fn getTableFunction(self: *Instance, index: u32) ?*Function {
+        if (index >= self.function_table.items.len) return null;
+        return self.function_table.items[index];
+    }
+
+    /// Call a function indirectly by table index (for call_indirect instruction)
+    pub fn callIndirect(self: *Instance, table_index: u32, params: []const Value) ![]Value {
+        const func = self.getTableFunction(table_index) orelse return error.TableIndexOutOfBounds;
+
+        // Validate parameters
+        if (params.len != func.param_types.len) {
+            return error.InvalidParameterCount;
+        }
+
+        return switch (func.code) {
+            .host => |host_fn| try host_fn(params, self.allocator),
+            .wasm => |bytecode| {
+                var interp = try interpreter.Interpreter.init(self.allocator, self, params.len);
+                defer interp.deinit();
+
+                for (params, 0..) |param, i| {
+                    try interp.locals.set(@intCast(i), param);
+                }
+
+                return try interp.execute(bytecode);
+            },
+        };
     }
 
     pub fn getFunction(self: *Instance, name: []const u8) ?*Function {

@@ -139,7 +139,7 @@ pub const Client = struct {
         if (!self.connected) return Error.ConnectionFailed;
 
         // Build RESP array command
-        var cmd: std.ArrayList(u8) = .{};
+        var cmd: std.ArrayListUnmanaged(u8) = .{};
         defer cmd.deinit(self.allocator);
 
         // Array header
@@ -404,73 +404,104 @@ pub const Client = struct {
         defer result.deinit(self.allocator);
     }
 
-    // Internal RESP parser
+    // Internal RESP parser with position tracking
 
     fn readValue(self: *Client) !Value {
-        var buf: [8192]u8 = undefined;
+        var buf: [65536]u8 = undefined;
         const n = try self.tcp_client.read(&buf);
 
         if (n == 0) return Error.InvalidResponse;
 
-        const type_byte = buf[0];
-        const data = buf[1..n];
+        var pos: usize = 0;
+        return try self.parseValueAt(buf[0..n], &pos);
+    }
+
+    fn parseValueAt(self: *Client, data: []const u8, pos: *usize) !Value {
+        if (pos.* >= data.len) return Error.InvalidResponse;
+
+        const type_byte = data[pos.*];
+        pos.* += 1;
 
         return switch (type_byte) {
-            '+' => try self.parseSimpleString(data),
-            '-' => try self.parseError(data),
-            ':' => try self.parseInt(data),
-            '$' => try self.parseBulkString(data),
-            '*' => try self.parseArray(data),
+            '+' => try self.parseSimpleStringAt(data, pos),
+            '-' => try self.parseErrorAt(data, pos),
+            ':' => try self.parseIntAt(data, pos),
+            '$' => try self.parseBulkStringAt(data, pos),
+            '*' => try self.parseArrayAt(data, pos),
             else => Error.InvalidResponse,
         };
     }
 
-    fn parseSimpleString(self: *Client, data: []const u8) !Value {
-        const end = std.mem.indexOf(u8, data, "\r\n") orelse return Error.InvalidResponse;
-        const str = try self.allocator.dupe(u8, data[0..end]);
+    fn parseSimpleStringAt(self: *Client, data: []const u8, pos: *usize) !Value {
+        const start = pos.*;
+        const end = std.mem.indexOf(u8, data[start..], "\r\n") orelse return Error.InvalidResponse;
+        const str = try self.allocator.dupe(u8, data[start .. start + end]);
+        pos.* = start + end + 2;
         return Value{ .simple_string = str };
     }
 
-    fn parseError(self: *Client, data: []const u8) !Value {
-        const end = std.mem.indexOf(u8, data, "\r\n") orelse return Error.InvalidResponse;
-        const str = try self.allocator.dupe(u8, data[0..end]);
+    fn parseErrorAt(self: *Client, data: []const u8, pos: *usize) !Value {
+        const start = pos.*;
+        const end = std.mem.indexOf(u8, data[start..], "\r\n") orelse return Error.InvalidResponse;
+        const str = try self.allocator.dupe(u8, data[start .. start + end]);
+        pos.* = start + end + 2;
         return Value{ .error_msg = str };
     }
 
-    fn parseInt(self: *Client, data: []const u8) !Value {
+    fn parseIntAt(self: *Client, data: []const u8, pos: *usize) !Value {
         _ = self;
-        const end = std.mem.indexOf(u8, data, "\r\n") orelse return Error.InvalidResponse;
-        const int = try std.fmt.parseInt(i64, data[0..end], 10);
+        const start = pos.*;
+        const end = std.mem.indexOf(u8, data[start..], "\r\n") orelse return Error.InvalidResponse;
+        const int = try std.fmt.parseInt(i64, data[start .. start + end], 10);
+        pos.* = start + end + 2;
         return Value{ .integer = int };
     }
 
-    fn parseBulkString(self: *Client, data: []const u8) !Value {
-        const end = std.mem.indexOf(u8, data, "\r\n") orelse return Error.InvalidResponse;
-        const len = try std.fmt.parseInt(i64, data[0..end], 10);
+    fn parseBulkStringAt(self: *Client, data: []const u8, pos: *usize) !Value {
+        const start = pos.*;
+        const end = std.mem.indexOf(u8, data[start..], "\r\n") orelse return Error.InvalidResponse;
+        const len = try std.fmt.parseInt(i64, data[start .. start + end], 10);
+        pos.* = start + end + 2;
 
         if (len == -1) {
             return Value{ .null_value = {} };
         }
 
-        const start = end + 2;
-        const str_end = start + @as(usize, @intCast(len));
+        const str_start = pos.*;
+        const str_len: usize = @intCast(len);
+        const str_end = str_start + str_len;
 
         if (str_end > data.len) return Error.InvalidResponse;
 
-        const str = try self.allocator.dupe(u8, data[start..str_end]);
+        const str = try self.allocator.dupe(u8, data[str_start..str_end]);
+        pos.* = str_end + 2; // Skip \r\n after string
         return Value{ .bulk_string = str };
     }
 
-    fn parseArray(self: *Client, data: []const u8) !Value {
-        const end = std.mem.indexOf(u8, data, "\r\n") orelse return Error.InvalidResponse;
-        const count = try std.fmt.parseInt(i64, data[0..end], 10);
+    fn parseArrayAt(self: *Client, data: []const u8, pos: *usize) !Value {
+        const start = pos.*;
+        const end = std.mem.indexOf(u8, data[start..], "\r\n") orelse return Error.InvalidResponse;
+        const count = try std.fmt.parseInt(i64, data[start .. start + end], 10);
+        pos.* = start + end + 2;
 
         if (count == -1) {
             return Value{ .null_value = {} };
         }
 
-        // Simplified - would need to recursively parse array elements
-        const arr = try self.allocator.alloc(Value, @intCast(count));
+        const arr_count: usize = @intCast(count);
+        const arr = try self.allocator.alloc(Value, arr_count);
+        errdefer {
+            for (arr) |*item| {
+                item.deinit(self.allocator);
+            }
+            self.allocator.free(arr);
+        }
+
+        // Recursively parse array elements
+        for (0..arr_count) |i| {
+            arr[i] = try self.parseValueAt(data, pos);
+        }
+
         return Value{ .array = arr };
     }
 };

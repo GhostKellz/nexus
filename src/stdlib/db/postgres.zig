@@ -22,21 +22,29 @@ pub const ConnectionConfig = struct {
 };
 
 pub const QueryResult = struct {
-    rows: std.ArrayList(Row),
-    columns: std.ArrayList(Column),
+    rows: std.ArrayListUnmanaged(Row),
+    columns: std.ArrayListUnmanaged(Column),
     rows_affected: usize = 0,
     allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator) QueryResult {
+        return .{
+            .rows = .{},
+            .columns = .{},
+            .allocator = allocator,
+        };
+    }
 
     pub fn deinit(self: *QueryResult) void {
         for (self.rows.items) |*row| {
             row.deinit();
         }
-        self.rows.deinit();
+        self.rows.deinit(self.allocator);
 
         for (self.columns.items) |*col| {
             self.allocator.free(col.name);
         }
-        self.columns.deinit();
+        self.columns.deinit(self.allocator);
     }
 
     pub fn getRow(self: *QueryResult, index: usize) ?*Row {
@@ -52,12 +60,12 @@ pub const Column = struct {
 };
 
 pub const Row = struct {
-    values: std.ArrayList(?[]const u8),
+    values: std.ArrayListUnmanaged(?[]const u8),
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) Row {
         return Row{
-            .values = std.ArrayList(?[]const u8).init(allocator),
+            .values = .{},
             .allocator = allocator,
         };
     }
@@ -68,7 +76,7 @@ pub const Row = struct {
                 self.allocator.free(v);
             }
         }
-        self.values.deinit();
+        self.values.deinit(self.allocator);
     }
 
     pub fn get(self: *Row, index: usize) ?[]const u8 {
@@ -222,7 +230,7 @@ pub const Connection = struct {
     // Internal protocol methods
 
     fn sendStartupMessage(self: *Connection) !void {
-        var msg: std.ArrayList(u8) = .{};
+        var msg: std.ArrayListUnmanaged(u8) = .{};
         defer msg.deinit(self.allocator);
 
         // Protocol version 3.0
@@ -281,8 +289,14 @@ pub const Connection = struct {
             },
             5 => {
                 // AuthenticationMD5Password
-                std.debug.print("⚠ MD5 authentication not yet implemented\n", .{});
-                return Error.AuthenticationFailed;
+                if (self.config.password) |password| {
+                    // Extract 4-byte salt from message
+                    const salt = buf[9..13];
+                    try self.sendMD5Password(password, salt.*);
+                    try self.handleAuthentication(); // Recursive for next auth message
+                } else {
+                    return Error.AuthenticationFailed;
+                }
             },
             else => {
                 std.debug.print("⚠ Unknown auth type: {d}\n", .{auth_type});
@@ -292,13 +306,55 @@ pub const Connection = struct {
     }
 
     fn sendPassword(self: *Connection, password: []const u8) !void {
-        var msg: std.ArrayList(u8) = .{};
+        var msg: std.ArrayListUnmanaged(u8) = .{};
         defer msg.deinit(self.allocator);
 
         try msg.append(self.allocator, 'p'); // PasswordMessage
         const len: u32 = @intCast(password.len + 4 + 1);
         try msg.appendSlice(self.allocator, &std.mem.toBytes(std.mem.nativeTo(u32, len, .big)));
         try msg.appendSlice(self.allocator, password);
+        try msg.append(self.allocator, 0);
+
+        try self.client.write(msg.items);
+    }
+
+    /// Send MD5-hashed password for authentication
+    /// PostgreSQL MD5 format: "md5" + md5(md5(password + username) + salt)
+    fn sendMD5Password(self: *Connection, password: []const u8, salt: [4]u8) !void {
+        const Md5 = std.crypto.hash.Md5;
+
+        // Step 1: md5(password + username)
+        var hash1: [Md5.digest_length]u8 = undefined;
+        var h1 = Md5.init(.{});
+        h1.update(password);
+        h1.update(self.config.username);
+        h1.final(&hash1);
+
+        // Convert first hash to hex string
+        var hash1_hex: [32]u8 = undefined;
+        _ = std.fmt.bufPrint(&hash1_hex, "{s}", .{std.fmt.fmtSliceHexLower(&hash1)}) catch unreachable;
+
+        // Step 2: md5(hash1_hex + salt)
+        var hash2: [Md5.digest_length]u8 = undefined;
+        var h2 = Md5.init(.{});
+        h2.update(&hash1_hex);
+        h2.update(&salt);
+        h2.final(&hash2);
+
+        // Convert second hash to hex string
+        var hash2_hex: [32]u8 = undefined;
+        _ = std.fmt.bufPrint(&hash2_hex, "{s}", .{std.fmt.fmtSliceHexLower(&hash2)}) catch unreachable;
+
+        // Build password message: "md5" + hash2_hex + null terminator
+        var msg: std.ArrayListUnmanaged(u8) = .{};
+        defer msg.deinit(self.allocator);
+
+        try msg.append(self.allocator, 'p'); // PasswordMessage
+        const pwd_len: u32 = 3 + 32 + 1; // "md5" + 32-char hex + null
+        const len: u32 = pwd_len + 4; // + length field itself
+        try msg.appendSlice(self.allocator, &std.mem.toBytes(std.mem.nativeTo(u32, len, .big)));
+        try msg.appendSlice(self.allocator, "md5");
+        try msg.appendSlice(self.allocator, &hash2_hex);
         try msg.append(self.allocator, 0);
 
         try self.client.write(msg.items);
@@ -325,7 +381,7 @@ pub const Connection = struct {
     }
 
     fn sendSimpleQuery(self: *Connection, sql: []const u8) !void {
-        var msg: std.ArrayList(u8) = .{};
+        var msg: std.ArrayListUnmanaged(u8) = .{};
         defer msg.deinit(self.allocator);
 
         try msg.append(self.allocator, 'Q'); // Query
@@ -338,47 +394,146 @@ pub const Connection = struct {
     }
 
     fn parseQueryResponse(self: *Connection) !QueryResult {
-        var result = QueryResult{
-            .rows = std.ArrayList(Row).init(self.allocator),
-            .columns = std.ArrayList(Column).init(self.allocator),
-            .allocator = self.allocator,
-        };
+        var result = QueryResult.init(self.allocator);
         errdefer result.deinit();
 
-        var buf: [8192]u8 = undefined;
+        var buf: [65536]u8 = undefined;
+        var buf_pos: usize = 0;
+        var buf_len: usize = 0;
 
-        // Simplified response parser (would need full protocol implementation)
         while (true) {
-            const n = try self.client.read(&buf);
-            if (n < 5) continue;
+            // Ensure we have at least 5 bytes (type + length)
+            while (buf_len - buf_pos < 5) {
+                if (buf_pos > 0 and buf_len > buf_pos) {
+                    // Move remaining data to start
+                    std.mem.copyForwards(u8, buf[0 .. buf_len - buf_pos], buf[buf_pos..buf_len]);
+                    buf_len -= buf_pos;
+                    buf_pos = 0;
+                } else {
+                    buf_len = 0;
+                    buf_pos = 0;
+                }
+                const n = try self.client.read(buf[buf_len..]);
+                if (n == 0) return Error.InvalidResponse;
+                buf_len += n;
+            }
 
-            const msg_type: MessageType = @enumFromInt(buf[0]);
+            const msg_type: MessageType = @enumFromInt(buf[buf_pos]);
+            const msg_len = std.mem.readInt(u32, buf[buf_pos + 1 ..][0..4], .big);
+
+            // Ensure we have the full message
+            while (buf_len - buf_pos < 1 + msg_len) {
+                if (buf_pos > 0) {
+                    std.mem.copyForwards(u8, buf[0 .. buf_len - buf_pos], buf[buf_pos..buf_len]);
+                    buf_len -= buf_pos;
+                    buf_pos = 0;
+                }
+                const n = try self.client.read(buf[buf_len..]);
+                if (n == 0) return Error.InvalidResponse;
+                buf_len += n;
+            }
+
+            const msg_data = buf[buf_pos + 5 .. buf_pos + 1 + msg_len];
+            buf_pos += 1 + msg_len;
 
             switch (msg_type) {
                 .RowDescription => {
-                    // Parse column metadata (simplified)
-                    std.debug.print("📋 Received RowDescription\n", .{});
+                    // Parse column metadata per PostgreSQL protocol
+                    if (msg_data.len < 2) continue;
+                    const num_fields = std.mem.readInt(u16, msg_data[0..2], .big);
+                    var pos: usize = 2;
+
+                    for (0..num_fields) |_| {
+                        // Column name (null-terminated string)
+                        const name_end = std.mem.indexOfScalar(u8, msg_data[pos..], 0) orelse break;
+                        const name = try self.allocator.dupe(u8, msg_data[pos .. pos + name_end]);
+                        pos += name_end + 1;
+
+                        if (pos + 18 > msg_data.len) {
+                            self.allocator.free(name);
+                            break;
+                        }
+
+                        // Skip table OID (4), column attr (2)
+                        pos += 6;
+                        // Type OID
+                        const type_oid = std.mem.readInt(u32, msg_data[pos..][0..4], .big);
+                        pos += 4;
+                        // Type size
+                        const type_size = std.mem.readInt(i16, msg_data[pos..][0..2], .big);
+                        pos += 2;
+                        // Skip type modifier (4), format code (2)
+                        pos += 6;
+
+                        try result.columns.append(self.allocator, Column{
+                            .name = name,
+                            .type_oid = type_oid,
+                            .type_size = type_size,
+                        });
+                    }
+                    std.debug.print("📋 Received RowDescription: {d} columns\n", .{num_fields});
                 },
                 .DataRow => {
-                    // Parse row data (simplified)
-                    const row = Row.init(self.allocator);
-                    try result.rows.append(row);
+                    // Parse row data per PostgreSQL protocol
+                    if (msg_data.len < 2) continue;
+                    const num_cols = std.mem.readInt(u16, msg_data[0..2], .big);
+                    var pos: usize = 2;
+
+                    var row = Row.init(self.allocator);
+                    errdefer row.deinit();
+
+                    for (0..num_cols) |_| {
+                        if (pos + 4 > msg_data.len) break;
+                        const col_len_raw = std.mem.readInt(i32, msg_data[pos..][0..4], .big);
+                        pos += 4;
+
+                        if (col_len_raw == -1) {
+                            // NULL value
+                            try row.values.append(self.allocator, null);
+                        } else {
+                            const col_len: usize = @intCast(col_len_raw);
+                            if (pos + col_len > msg_data.len) break;
+                            const value = try self.allocator.dupe(u8, msg_data[pos .. pos + col_len]);
+                            try row.values.append(self.allocator, value);
+                            pos += col_len;
+                        }
+                    }
+                    try result.rows.append(self.allocator, row);
                 },
                 .CommandComplete => {
-                    // Query completed successfully
-                    std.debug.print("✓ Query completed\n", .{});
+                    // Parse rows affected from command tag
+                    if (std.mem.lastIndexOfScalar(u8, msg_data, ' ')) |space_pos| {
+                        const num_str = msg_data[space_pos + 1 ..];
+                        if (num_str.len > 0 and num_str[num_str.len - 1] == 0) {
+                            result.rows_affected = std.fmt.parseInt(usize, num_str[0 .. num_str.len - 1], 10) catch 0;
+                        }
+                    }
+                    std.debug.print("✓ Query completed ({d} rows affected)\n", .{result.rows_affected});
                 },
                 .ReadyForQuery => {
                     // Ready for next query
-                    self.transaction_status = buf[5];
+                    if (msg_data.len > 0) {
+                        self.transaction_status = msg_data[0];
+                    }
                     break;
                 },
                 .ErrorResponse => {
-                    std.debug.print("❌ Query error\n", .{});
+                    // Parse error message
+                    var pos: usize = 0;
+                    while (pos < msg_data.len and msg_data[pos] != 0) {
+                        const field_type = msg_data[pos];
+                        pos += 1;
+                        const field_end = std.mem.indexOfScalar(u8, msg_data[pos..], 0) orelse break;
+                        const field_value = msg_data[pos .. pos + field_end];
+                        if (field_type == 'M') { // Message
+                            std.debug.print("❌ Query error: {s}\n", .{field_value});
+                        }
+                        pos += field_end + 1;
+                    }
                     return Error.QueryFailed;
                 },
                 else => {
-                    // Skip unknown messages
+                    // Skip other messages (ParameterStatus, NoticeResponse, etc.)
                     continue;
                 },
             }
@@ -390,7 +545,7 @@ pub const Connection = struct {
 
 /// Connection pool for PostgreSQL
 pub const Pool = struct {
-    connections: std.ArrayList(*Connection),
+    connections: std.ArrayListUnmanaged(*Connection),
     config: ConnectionConfig,
     allocator: std.mem.Allocator,
     max_size: usize,
@@ -398,7 +553,7 @@ pub const Pool = struct {
 
     pub fn init(allocator: std.mem.Allocator, config: ConnectionConfig, max_size: usize) !Pool {
         return Pool{
-            .connections = std.ArrayList(*Connection).init(allocator),
+            .connections = .{},
             .config = config,
             .allocator = allocator,
             .max_size = max_size,
@@ -410,7 +565,7 @@ pub const Pool = struct {
             conn.deinit();
             self.allocator.destroy(conn);
         }
-        self.connections.deinit();
+        self.connections.deinit(self.allocator);
     }
 
     pub fn acquire(self: *Pool) !*Connection {
@@ -419,7 +574,7 @@ pub const Pool = struct {
 
         // Try to reuse existing connection
         if (self.connections.items.len > 0) {
-            return self.connections.pop();
+            return self.connections.pop().?;
         }
 
         // Create new connection
@@ -437,7 +592,7 @@ pub const Pool = struct {
         defer self.mutex.unlock();
 
         if (self.connections.items.len < self.max_size) {
-            try self.connections.append(conn);
+            try self.connections.append(self.allocator, conn);
         } else {
             conn.deinit();
             self.allocator.destroy(conn);
