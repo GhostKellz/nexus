@@ -23,10 +23,8 @@ pub const Middleware = struct {
 
 /// Logger middleware - logs all requests
 pub fn logger(req: *http.Request, res: *http.Response, next: *const fn () anyerror!void) anyerror!void {
-    const start = std.time.Instant.now() catch |err| {
-        std.debug.print("Warning: Could not get timestamp: {}\n", .{err});
-        return next();
-    };
+    // Use monotonic clock for timing (suitable for measuring elapsed time)
+    const start = std.Io.Timestamp.now(res.io, .awake);
 
     // Log request
     std.debug.print("[{s}] {s}\n", .{ req.method.toString(), req.path });
@@ -35,9 +33,9 @@ pub fn logger(req: *http.Request, res: *http.Response, next: *const fn () anyerr
     try next();
 
     // Log response time
-    const end = std.time.Instant.now() catch start;
-    const duration_ns = end.since(start);
-    const duration_ms = @as(f64, @floatFromInt(duration_ns)) / 1_000_000.0;
+    const end = std.Io.Timestamp.now(res.io, .awake);
+    const duration = start.durationTo(end);
+    const duration_ms = @as(f64, @floatFromInt(duration.nanoseconds)) / 1_000_000.0;
     std.debug.print("  -> {d} {s} ({d:.2}ms)\n", .{
         res.status_code.toInt(),
         res.status_code.toString(),

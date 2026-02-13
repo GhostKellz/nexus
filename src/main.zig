@@ -9,7 +9,7 @@ var runtime_io: ?Io = null;
 
 /// Get current timestamp in nanoseconds
 fn getCurrentTimeNs(io: Io) u64 {
-    const ts = Io.Clock.real.now(io) catch return 0;
+    const ts = Io.Clock.real.now(io);
     // ts.nanoseconds is i96, convert to u64 for uptime tracking
     if (ts.nanoseconds < 0) return 0;
     return @intCast(@min(ts.nanoseconds, std.math.maxInt(u64)));
@@ -32,7 +32,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Welcome message
     nexus.console.info("⚡ Nexus Runtime v0.1.0", .{});
-    nexus.console.info("Node.js reimagined in Zig + WASM - 10x better", .{});
+    nexus.console.info("Node.js reimagined in Zig + WASM", .{});
     nexus.console.info("", .{});
 
     // Get command line arguments

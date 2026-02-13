@@ -40,11 +40,13 @@ pub const TimerHeap = struct {
     timers: std.PriorityQueue(Timer, void, compareTimers),
     next_id: u64 = 1,
     allocator: std.mem.Allocator,
+    io: std.Io,
 
-    pub fn init(allocator: std.mem.Allocator) TimerHeap {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io) TimerHeap {
         return TimerHeap{
             .timers = std.PriorityQueue(Timer, void, compareTimers).init(allocator, {}),
             .allocator = allocator,
+            .io = io,
         };
     }
 
@@ -56,9 +58,15 @@ pub const TimerHeap = struct {
         return std.math.order(a.deadline, b.deadline);
     }
 
+    /// Get current time in milliseconds using monotonic clock
+    fn getCurrentTimeMs(self: *TimerHeap) i64 {
+        const ts = std.Io.Timestamp.now(self.io, .awake);
+        // Convert nanoseconds to milliseconds
+        return @intCast(@divFloor(ts.nanoseconds, std.time.ns_per_ms));
+    }
+
     pub fn setTimeout(self: *TimerHeap, delay_ms: u64, callback: TimerCallback) !u64 {
-        var timer_start = try std.time.Timer.start();
-        const now_ms = @as(i64, @intCast(timer_start.read() / std.time.ns_per_ms));
+        const now_ms = self.getCurrentTimeMs();
         const timer = Timer{
             .id = self.next_id,
             .deadline = now_ms + @as(i64, @intCast(delay_ms)),
@@ -71,8 +79,7 @@ pub const TimerHeap = struct {
     }
 
     pub fn setInterval(self: *TimerHeap, interval_ms: u64, callback: TimerCallback) !u64 {
-        const now = try std.time.Instant.now();
-        const now_ms = @as(i64, @intCast(now.order(.{}) / std.time.ns_per_ms));
+        const now_ms = self.getCurrentTimeMs();
         const timer = Timer{
             .id = self.next_id,
             .deadline = now_ms + @as(i64, @intCast(interval_ms)),
@@ -95,8 +102,7 @@ pub const TimerHeap = struct {
     }
 
     pub fn processExpired(self: *TimerHeap) !void {
-        var timer_obj = try std.time.Timer.start();
-        const now = @as(i64, @intCast(timer_obj.read() / std.time.ns_per_ms));
+        const now = self.getCurrentTimeMs();
 
         while (self.timers.peek()) |timer| {
             if (timer.deadline > now) break;
@@ -119,10 +125,10 @@ pub const TimerHeap = struct {
 
     pub fn nextTimeout(self: *TimerHeap) ?u64 {
         if (self.timers.peek()) |timer| {
-            var timer_obj = std.time.Timer.start() catch return 0;
-            const now = @as(i64, @intCast(timer_obj.read() / std.time.ns_per_ms));
+            const now = self.getCurrentTimeMs();
             const diff = timer.deadline - now;
-            return @max(0, @as(u64, @intCast(diff)));
+            if (diff <= 0) return 0;
+            return @intCast(diff);
         }
         return null;
     }
@@ -528,17 +534,19 @@ const IocpPoller = struct {
 /// Main event loop
 pub const EventLoop = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     io_poller: IoPoller,
     timer_heap: TimerHeap,
     task_queue: TaskQueue,
     immediate_queue: ImmediateQueue,
     is_running: bool = false,
 
-    pub fn init(allocator: std.mem.Allocator) !EventLoop {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io) !EventLoop {
         return EventLoop{
             .allocator = allocator,
+            .io = io,
             .io_poller = try IoPoller.init(allocator),
-            .timer_heap = TimerHeap.init(allocator),
+            .timer_heap = TimerHeap.init(allocator, io),
             .task_queue = TaskQueue.init(allocator),
             .immediate_queue = ImmediateQueue.init(allocator),
         };

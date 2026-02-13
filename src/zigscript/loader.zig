@@ -211,7 +211,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !i32 {
     var wasm_engine = engine.Engine.init(allocator);
     defer wasm_engine.deinit();
 
-    var loop = try event_loop.EventLoop.init(allocator);
+    var loop = try event_loop.EventLoop.init(allocator, io);
     defer loop.deinit();
 
     var loader = ZigScriptLoader.init(allocator, &wasm_engine, &loop, io);
