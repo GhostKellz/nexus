@@ -44,14 +44,14 @@ pub const TimerHeap = struct {
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io) TimerHeap {
         return TimerHeap{
-            .timers = std.PriorityQueue(Timer, void, compareTimers).init(allocator, {}),
+            .timers = std.PriorityQueue(Timer, void, compareTimers).initContext({}),
             .allocator = allocator,
             .io = io,
         };
     }
 
     pub fn deinit(self: *TimerHeap) void {
-        self.timers.deinit();
+        self.timers.deinit(self.allocator);
     }
 
     fn compareTimers(_: void, a: Timer, b: Timer) std.math.Order {
@@ -73,7 +73,7 @@ pub const TimerHeap = struct {
             .callback = callback,
             .repeat = null,
         };
-        try self.timers.add(timer);
+        try self.timers.push(self.allocator, timer);
         self.next_id += 1;
         return timer.id;
     }
@@ -86,7 +86,7 @@ pub const TimerHeap = struct {
             .callback = callback,
             .repeat = interval_ms,
         };
-        try self.timers.add(timer);
+        try self.timers.push(self.allocator, timer);
         self.next_id += 1;
         return timer.id;
     }
@@ -107,7 +107,7 @@ pub const TimerHeap = struct {
         while (self.timers.peek()) |timer| {
             if (timer.deadline > now) break;
 
-            var expired = self.timers.remove();
+            var expired = self.timers.pop().?;
 
             // Skip cancelled timers
             if (expired.cancelled) continue;
@@ -118,7 +118,7 @@ pub const TimerHeap = struct {
             // Re-add if repeating
             if (expired.repeat) |interval| {
                 expired.deadline = now + @as(i64, @intCast(interval));
-                try self.timers.add(expired);
+                try self.timers.push(self.allocator, expired);
             }
         }
     }
@@ -203,7 +203,7 @@ const EpollPoller = struct {
     }
 
     pub fn deinit(self: *EpollPoller) void {
-        std.posix.close(self.epoll_fd);
+        _ = std.os.linux.close(self.epoll_fd);
         self.allocator.free(self.events);
     }
 
@@ -260,7 +260,7 @@ const KqueuePoller = struct {
     }
 
     pub fn deinit(self: *KqueuePoller) void {
-        std.posix.close(self.kqueue_fd);
+        _ = std.posix.system.close(self.kqueue_fd);
         self.allocator.free(self.events);
     }
 
