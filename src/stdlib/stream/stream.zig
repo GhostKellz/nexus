@@ -112,7 +112,7 @@ pub const Writable = struct {
     pub fn init(allocator: std.mem.Allocator) Writable {
         return Writable{
             .allocator = allocator,
-            .buffer = .{},
+            .buffer = .empty,
         };
     }
 

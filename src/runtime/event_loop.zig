@@ -141,7 +141,7 @@ pub const TaskQueue = struct {
 
     pub fn init(allocator: std.mem.Allocator) TaskQueue {
         return TaskQueue{
-            .queue = .{},
+            .queue = .empty,
             .allocator = allocator,
         };
     }

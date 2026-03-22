@@ -146,7 +146,7 @@ pub const WebSocket = struct {
     pub fn send(self: *WebSocket, data: []const u8, opcode: Opcode) !void {
         if (self.is_closed) return error.WebSocketClosed;
 
-        var buffer: std.ArrayList(u8) = .{};
+        var buffer: std.ArrayList(u8) = .empty;
         defer buffer.deinit(self.allocator);
 
         const header = FrameHeader{

@@ -198,7 +198,7 @@ pub const Response = struct {
         }
 
         // Build response header
-        var header_buf: std.ArrayList(u8) = .{};
+        var header_buf: std.ArrayList(u8) = .empty;
         defer header_buf.deinit(self.allocator);
 
         // Status line
@@ -245,7 +245,7 @@ pub const Response = struct {
         _ = try self.setHeader("Content-Type", "application/json");
 
         // Use std.json.Stringify with Io.Writer
-        var json_buf: std.ArrayList(u8) = .{};
+        var json_buf: std.ArrayList(u8) = .empty;
         defer json_buf.deinit(self.allocator);
 
         // Create Io.Writer
@@ -276,7 +276,7 @@ pub const Response = struct {
 
     /// Set a cookie with optional parameters
     pub fn setCookie(self: *Response, name: []const u8, value: []const u8, options: CookieOptions) !*Response {
-        var cookie_value: std.ArrayList(u8) = .{};
+        var cookie_value: std.ArrayList(u8) = .empty;
         defer cookie_value.deinit(self.allocator);
 
         // name=value
@@ -360,7 +360,7 @@ pub const Response = struct {
         const accept_key = encoder.encode(&encoded, &hash);
 
         // Send 101 Switching Protocols response
-        var header_buf: std.ArrayList(u8) = .{};
+        var header_buf: std.ArrayList(u8) = .empty;
         defer header_buf.deinit(self.allocator);
 
         try header_buf.appendSlice(self.allocator, "HTTP/1.1 101 Switching Protocols\r\n");
@@ -420,8 +420,8 @@ pub const Server = struct {
         return Server{
             .config = config,
             .tcp_server = tcp_server,
-            .routes = .{},
-            .middlewares = .{},
+            .routes = .empty,
+            .middlewares = .empty,
             .allocator = allocator,
         };
     }

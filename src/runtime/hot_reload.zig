@@ -20,7 +20,7 @@ pub const FileWatcher = struct {
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io) FileWatcher {
         return FileWatcher{
-            .watch_paths = std.ArrayList([]const u8){},
+            .watch_paths = .empty,
             .last_modified = std.StringHashMap(std.Io.Timestamp).init(allocator),
             .allocator = allocator,
             .io = io,
@@ -81,7 +81,7 @@ pub const FileWatcher = struct {
 
     /// Check for file changes
     pub fn checkChanges(self: *FileWatcher) ![]const []const u8 {
-        var changed_files = std.ArrayList([]const u8){};
+        var changed_files: std.ArrayList([]const u8) = .empty;
         errdefer changed_files.deinit(self.allocator);
 
         const cwd = std.Io.Dir.cwd();
@@ -176,7 +176,7 @@ pub const HotReloadManager = struct {
     pub fn rebuild(self: *HotReloadManager) !void {
         std.debug.print("🔨 Building...\n", .{});
 
-        var args = std.ArrayList([]const u8){};
+        var args: std.ArrayList([]const u8) = .empty;
         defer args.deinit(self.allocator);
 
         // Split build command by spaces
@@ -223,7 +223,7 @@ pub const HotReloadManager = struct {
         if (self.run_command) |cmd| {
             std.debug.print("🚀 Starting: {s}\n", .{cmd});
 
-            var args = std.ArrayList([]const u8){};
+            var args: std.ArrayList([]const u8) = .empty;
             defer args.deinit(self.allocator);
 
             var it = std.mem.splitScalar(u8, cmd, ' ');

@@ -63,7 +63,7 @@ pub const Client = struct {
 
     /// Make a GET request and return the response body
     pub fn get(self: *Client, url: []const u8) ![]const u8 {
-        var response_body: std.ArrayListUnmanaged(u8) = .{};
+        var response_body: std.ArrayListUnmanaged(u8) = .empty;
         errdefer response_body.deinit(self.allocator);
 
         var writer_inst = ArrayListWriter.init(&response_body, self.allocator);
@@ -82,7 +82,7 @@ pub const Client = struct {
 
     /// Make a POST request with a body and return the response
     pub fn post(self: *Client, url: []const u8, body: []const u8, content_type: []const u8) ![]const u8 {
-        var response_body: std.ArrayListUnmanaged(u8) = .{};
+        var response_body: std.ArrayListUnmanaged(u8) = .empty;
         errdefer response_body.deinit(self.allocator);
 
         var writer_inst = ArrayListWriter.init(&response_body, self.allocator);
@@ -113,7 +113,7 @@ pub const Client = struct {
     };
 
     pub fn request(self: *Client, url: []const u8, options: RequestOptions) ![]const u8 {
-        var response_body: std.ArrayListUnmanaged(u8) = .{};
+        var response_body: std.ArrayListUnmanaged(u8) = .empty;
         errdefer response_body.deinit(self.allocator);
 
         var writer_inst = ArrayListWriter.init(&response_body, self.allocator);

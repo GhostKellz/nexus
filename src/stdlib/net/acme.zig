@@ -882,18 +882,18 @@ pub const Client = struct {
         //   signature BIT STRING
         // }
 
-        var csr_der: std.ArrayList(u8) = .{};
+        var csr_der: std.ArrayList(u8) = .empty;
         errdefer csr_der.deinit(self.allocator);
 
         // Build CertificationRequestInfo
-        var cert_req_info: std.ArrayList(u8) = .{};
+        var cert_req_info: std.ArrayList(u8) = .empty;
         defer cert_req_info.deinit(self.allocator);
 
         // Version: INTEGER 0
         try cert_req_info.appendSlice(self.allocator, &[_]u8{ 0x02, 0x01, 0x00 });
 
         // Subject: SEQUENCE { SET { SEQUENCE { OID commonName, UTF8String domain } } }
-        var subject: std.ArrayList(u8) = .{};
+        var subject: std.ArrayList(u8) = .empty;
         defer subject.deinit(self.allocator);
 
         // Common Name OID: 2.5.4.3
@@ -906,14 +906,14 @@ pub const Client = struct {
         try subject.appendSlice(self.allocator, domains[0]);
 
         // Wrap in SEQUENCE
-        var cn_seq: std.ArrayList(u8) = .{};
+        var cn_seq: std.ArrayList(u8) = .empty;
         defer cn_seq.deinit(self.allocator);
         try cn_seq.append(self.allocator, 0x30); // SEQUENCE
         try cn_seq.append(self.allocator, @intCast(subject.items.len));
         try cn_seq.appendSlice(self.allocator, subject.items);
 
         // Wrap in SET
-        var cn_set: std.ArrayList(u8) = .{};
+        var cn_set: std.ArrayList(u8) = .empty;
         defer cn_set.deinit(self.allocator);
         try cn_set.append(self.allocator, 0x31); // SET
         try cn_set.append(self.allocator, @intCast(cn_seq.items.len));
@@ -926,7 +926,7 @@ pub const Client = struct {
 
         // SubjectPublicKeyInfo for EC P-256
         // SEQUENCE { AlgorithmIdentifier, BIT STRING publicKey }
-        var spki: std.ArrayList(u8) = .{};
+        var spki: std.ArrayList(u8) = .empty;
         defer spki.deinit(self.allocator);
 
         // AlgorithmIdentifier: ecPublicKey (1.2.840.10045.2.1) with P-256 (1.2.840.10045.3.1.7)
@@ -954,11 +954,11 @@ pub const Client = struct {
         try cert_req_info.appendSlice(self.allocator, spki.items);
 
         // Attributes [0] with Subject Alternative Names extension
-        var attrs: std.ArrayList(u8) = .{};
+        var attrs: std.ArrayList(u8) = .empty;
         defer attrs.deinit(self.allocator);
 
         // Build SAN extension
-        var san_values: std.ArrayList(u8) = .{};
+        var san_values: std.ArrayList(u8) = .empty;
         defer san_values.deinit(self.allocator);
 
         for (domains) |domain| {
@@ -972,14 +972,14 @@ pub const Client = struct {
         const san_oid = [_]u8{ 0x06, 0x03, 0x55, 0x1D, 0x11 };
 
         // Extension value (OCTET STRING containing SEQUENCE of SAN values)
-        var ext_value: std.ArrayList(u8) = .{};
+        var ext_value: std.ArrayList(u8) = .empty;
         defer ext_value.deinit(self.allocator);
         try ext_value.append(self.allocator, 0x30); // SEQUENCE
         try ext_value.append(self.allocator, @intCast(san_values.items.len));
         try ext_value.appendSlice(self.allocator, san_values.items);
 
         // Wrap extension
-        var ext_seq: std.ArrayList(u8) = .{};
+        var ext_seq: std.ArrayList(u8) = .empty;
         defer ext_seq.deinit(self.allocator);
         try ext_seq.appendSlice(self.allocator, &san_oid);
         try ext_seq.append(self.allocator, 0x04); // OCTET STRING
@@ -987,7 +987,7 @@ pub const Client = struct {
         try ext_seq.appendSlice(self.allocator, ext_value.items);
 
         // Extensions SEQUENCE
-        var exts_seq: std.ArrayList(u8) = .{};
+        var exts_seq: std.ArrayList(u8) = .empty;
         defer exts_seq.deinit(self.allocator);
         try exts_seq.append(self.allocator, 0x30); // SEQUENCE
         try exts_seq.append(self.allocator, @intCast(ext_seq.items.len));
@@ -997,7 +997,7 @@ pub const Client = struct {
         const ext_req_oid = [_]u8{ 0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x0E };
 
         // Build attribute
-        var attr_seq: std.ArrayList(u8) = .{};
+        var attr_seq: std.ArrayList(u8) = .empty;
         defer attr_seq.deinit(self.allocator);
         try attr_seq.appendSlice(self.allocator, &ext_req_oid);
         try attr_seq.append(self.allocator, 0x31); // SET
@@ -1015,7 +1015,7 @@ pub const Client = struct {
         try cert_req_info.appendSlice(self.allocator, attrs.items);
 
         // Wrap CertificationRequestInfo in SEQUENCE
-        var cert_req_info_seq: std.ArrayList(u8) = .{};
+        var cert_req_info_seq: std.ArrayList(u8) = .empty;
         defer cert_req_info_seq.deinit(self.allocator);
         try cert_req_info_seq.append(self.allocator, 0x30);
         try appendDerLength(&cert_req_info_seq, self.allocator, cert_req_info.items.len);
@@ -1047,7 +1047,7 @@ pub const Client = struct {
         try csr_der.appendSlice(self.allocator, &sig_alg);
 
         // Signature as BIT STRING (DER-encoded r and s)
-        var sig_der: std.ArrayList(u8) = .{};
+        var sig_der: std.ArrayList(u8) = .empty;
         defer sig_der.deinit(self.allocator);
 
         // Encode r as INTEGER
@@ -1081,7 +1081,7 @@ pub const Client = struct {
         try csr_der.appendSlice(self.allocator, sig_der.items);
 
         // Wrap entire CSR in SEQUENCE
-        var final_csr: std.ArrayList(u8) = .{};
+        var final_csr: std.ArrayList(u8) = .empty;
         errdefer final_csr.deinit(self.allocator);
         try final_csr.append(self.allocator, 0x30);
         try appendDerLength(&final_csr, self.allocator, csr_der.items.len);

@@ -29,8 +29,8 @@ pub const QueryResult = struct {
 
     pub fn init(allocator: std.mem.Allocator) QueryResult {
         return .{
-            .rows = .{},
-            .columns = .{},
+            .rows = .empty,
+            .columns = .empty,
             .allocator = allocator,
         };
     }
@@ -65,7 +65,7 @@ pub const Row = struct {
 
     pub fn init(allocator: std.mem.Allocator) Row {
         return Row{
-            .values = .{},
+            .values = .empty,
             .allocator = allocator,
         };
     }
@@ -230,7 +230,7 @@ pub const Connection = struct {
     // Internal protocol methods
 
     fn sendStartupMessage(self: *Connection) !void {
-        var msg: std.ArrayListUnmanaged(u8) = .{};
+        var msg: std.ArrayListUnmanaged(u8) = .empty;
         defer msg.deinit(self.allocator);
 
         // Protocol version 3.0
@@ -306,7 +306,7 @@ pub const Connection = struct {
     }
 
     fn sendPassword(self: *Connection, password: []const u8) !void {
-        var msg: std.ArrayListUnmanaged(u8) = .{};
+        var msg: std.ArrayListUnmanaged(u8) = .empty;
         defer msg.deinit(self.allocator);
 
         try msg.append(self.allocator, 'p'); // PasswordMessage
@@ -346,7 +346,7 @@ pub const Connection = struct {
         _ = std.fmt.bufPrint(&hash2_hex, "{s}", .{std.fmt.fmtSliceHexLower(&hash2)}) catch unreachable;
 
         // Build password message: "md5" + hash2_hex + null terminator
-        var msg: std.ArrayListUnmanaged(u8) = .{};
+        var msg: std.ArrayListUnmanaged(u8) = .empty;
         defer msg.deinit(self.allocator);
 
         try msg.append(self.allocator, 'p'); // PasswordMessage
@@ -381,7 +381,7 @@ pub const Connection = struct {
     }
 
     fn sendSimpleQuery(self: *Connection, sql: []const u8) !void {
-        var msg: std.ArrayListUnmanaged(u8) = .{};
+        var msg: std.ArrayListUnmanaged(u8) = .empty;
         defer msg.deinit(self.allocator);
 
         try msg.append(self.allocator, 'Q'); // Query
@@ -553,7 +553,7 @@ pub const Pool = struct {
 
     pub fn init(allocator: std.mem.Allocator, config: ConnectionConfig, max_size: usize) !Pool {
         return Pool{
-            .connections = .{},
+            .connections = .empty,
             .config = config,
             .allocator = allocator,
             .max_size = max_size,

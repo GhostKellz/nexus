@@ -34,7 +34,7 @@ pub const Server = struct {
         return Server{
             .config = config,
             .tcp_server = tcp_server,
-            .methods = .{},
+            .methods = .empty,
             .allocator = allocator,
         };
     }
@@ -108,7 +108,7 @@ pub const Server = struct {
         const response_data = try method.handler(message_data, arena_allocator);
 
         // Build gRPC response frame
-        var response_frame: std.ArrayList(u8) = .{};
+        var response_frame: std.ArrayList(u8) = .empty;
         defer response_frame.deinit(arena_allocator);
 
         // Compressed flag (0 = not compressed)
@@ -188,7 +188,7 @@ pub const Protobuf = struct {
 
     /// Simple message builder
     pub fn buildMessage(allocator: std.mem.Allocator, fields: anytype) ![]u8 {
-        var buf: std.ArrayList(u8) = .{};
+        var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(allocator);
 
         // Get field information from the struct
@@ -218,7 +218,7 @@ pub const Protobuf = struct {
 test "protobuf varint encoding" {
     const allocator = std.testing.allocator;
 
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
 
     try Protobuf.encodeVarint(150, buf.writer(allocator));

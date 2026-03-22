@@ -218,7 +218,7 @@ pub const Instance = struct {
         return Instance{
             .functions = std.StringHashMap(*Function).init(allocator),
             .globals = std.StringHashMap(Value).init(allocator),
-            .function_table = .{},
+            .function_table = .empty,
             .allocator = allocator,
         };
     }
@@ -369,7 +369,7 @@ pub const Module = struct {
 
     pub fn init(allocator: std.mem.Allocator) Module {
         return Module{
-            .instances = .{},
+            .instances = .empty,
             .allocator = allocator,
         };
     }
@@ -425,7 +425,7 @@ pub const Engine = struct {
 
     pub fn init(allocator: std.mem.Allocator) Engine {
         return Engine{
-            .modules = .{},
+            .modules = .empty,
             .allocator = allocator,
         };
     }

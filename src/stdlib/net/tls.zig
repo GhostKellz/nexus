@@ -527,7 +527,7 @@ pub const SessionCache = struct {
 
     /// Evict all expired sessions
     pub fn evictExpired(self: *SessionCache) !void {
-        var to_remove: std.ArrayListUnmanaged([32]u8) = .{};
+        var to_remove: std.ArrayListUnmanaged([32]u8) = .empty;
         defer to_remove.deinit(self.allocator);
 
         var iter = self.sessions.iterator();
@@ -825,8 +825,8 @@ pub const TlsConnection = struct {
             .config = config,
             .state = .initial,
             .is_server = is_server,
-            .read_buffer = .{},
-            .write_buffer = .{},
+            .read_buffer = .empty,
+            .write_buffer = .empty,
             .allocator = allocator,
         };
     }
@@ -911,7 +911,7 @@ pub const TlsConnection = struct {
     }
 
     fn sendClientHello(self: *TlsConnection) !void {
-        var hello_data: std.ArrayListUnmanaged(u8) = .{};
+        var hello_data: std.ArrayListUnmanaged(u8) = .empty;
         defer hello_data.deinit(self.allocator);
 
         // Client version (TLS 1.2 for compatibility)
@@ -989,7 +989,7 @@ pub const TlsConnection = struct {
     }
 
     fn sendServerHello(self: *TlsConnection) !void {
-        var hello_data: std.ArrayListUnmanaged(u8) = .{};
+        var hello_data: std.ArrayListUnmanaged(u8) = .empty;
         defer hello_data.deinit(self.allocator);
 
         // Server version
@@ -1021,7 +1021,7 @@ pub const TlsConnection = struct {
     }
 
     fn sendCertificate(self: *TlsConnection) !void {
-        var cert_data: std.ArrayListUnmanaged(u8) = .{};
+        var cert_data: std.ArrayListUnmanaged(u8) = .empty;
         defer cert_data.deinit(self.allocator);
 
         // Certificate list length
@@ -1106,7 +1106,7 @@ pub const TlsConnection = struct {
     }
 
     fn sendHandshakeMessage(self: *TlsConnection, msg_type: HandshakeType, payload: []const u8) !void {
-        var message: std.ArrayListUnmanaged(u8) = .{};
+        var message: std.ArrayListUnmanaged(u8) = .empty;
         defer message.deinit(self.allocator);
 
         // Handshake message header
@@ -1128,7 +1128,7 @@ pub const TlsConnection = struct {
     }
 
     fn sendRecord(self: *TlsConnection, content_type: ContentType, data: []const u8) !void {
-        var record_data: std.ArrayListUnmanaged(u8) = .{};
+        var record_data: std.ArrayListUnmanaged(u8) = .empty;
         defer record_data.deinit(self.allocator);
 
         // Record header

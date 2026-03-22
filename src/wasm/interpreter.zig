@@ -113,7 +113,7 @@ pub const Stack = struct {
 
     pub fn init(allocator: std.mem.Allocator) Stack {
         return Stack{
-            .values = .{},
+            .values = .empty,
             .allocator = allocator,
         };
     }
@@ -151,7 +151,7 @@ pub const LocalsFrame = struct {
 
     pub fn init(allocator: std.mem.Allocator, count: usize) !LocalsFrame {
         var frame = LocalsFrame{
-            .values = .{},
+            .values = .empty,
             .allocator = allocator,
         };
 
@@ -201,10 +201,10 @@ pub const Interpreter = struct {
         return Interpreter{
             .stack = Stack.init(allocator),
             .locals = try LocalsFrame.init(allocator, local_count),
-            .control_stack = .{},
+            .control_stack = .empty,
             .instance = instance,
             .allocator = allocator,
-            .globals = .{},
+            .globals = .empty,
         };
     }
 
@@ -389,7 +389,7 @@ pub const Interpreter = struct {
                 },
                 .br_table => {
                     const count = try readLEB128(u32, code, &pc);
-                    var targets: std.ArrayList(u32) = .{};
+                    var targets: std.ArrayList(u32) = .empty;
                     defer targets.deinit(self.allocator);
                     var i: u32 = 0;
                     while (i <= count) : (i += 1) {

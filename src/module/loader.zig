@@ -48,7 +48,7 @@ pub const ModuleResolver = struct {
     pub fn init(allocator: std.mem.Allocator) ModuleResolver {
         return ModuleResolver{
             .allocator = allocator,
-            .search_paths = .{},
+            .search_paths = .empty,
         };
     }
 

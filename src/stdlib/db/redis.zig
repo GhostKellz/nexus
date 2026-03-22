@@ -139,7 +139,7 @@ pub const Client = struct {
         if (!self.connected) return Error.ConnectionFailed;
 
         // Build RESP array command
-        var cmd: std.ArrayListUnmanaged(u8) = .{};
+        var cmd: std.ArrayListUnmanaged(u8) = .empty;
         defer cmd.deinit(self.allocator);
 
         // Array header
