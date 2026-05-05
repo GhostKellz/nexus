@@ -55,13 +55,11 @@ pub const TcpConnection = struct {
     }
 
     pub fn read(self: *TcpConnection, buffer: []u8) !usize {
-        // Use netRead directly
         var iovecs: [1][]u8 = .{buffer};
-        return self.io.io().vtable.netRead(self.io.io().userdata, self.stream.socket.handle, &iovecs);
+        return self.stream.read(self.io.io(), &iovecs);
     }
 
     pub fn writeAll(self: *TcpConnection, data: []const u8) !void {
-        // Use netWrite directly
         const iovecs: [1][]const u8 = .{data};
         const n = try self.io.io().vtable.netWrite(self.io.io().userdata, self.stream.socket.handle, "", &iovecs, 0);
         if (n != data.len) return error.ShortWrite;

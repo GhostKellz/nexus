@@ -47,7 +47,7 @@ pub const Event = extern struct {
 pub const EventFdReadwrite = extern struct {
     nbytes: u64,
     flags: u16,
-    _pad: [6]u8 = [_]u8{0} ** 6,
+    _pad: [6]u8 = @splat(0),
 };
 
 /// WASI subscription for poll_oneoff
@@ -59,7 +59,7 @@ pub const Subscription = extern struct {
 /// WASI subscription union wrapper
 pub const SubscriptionU = extern struct {
     tag: EventType,
-    _pad: [7]u8 = [_]u8{0} ** 7,
+    _pad: [7]u8 = @splat(0),
     u: SubscriptionUnion,
 };
 
@@ -76,13 +76,13 @@ pub const SubscriptionClock = extern struct {
     timeout: u64,
     precision: u64,
     flags: u16,
-    _pad: [6]u8 = [_]u8{0} ** 6,
+    _pad: [6]u8 = @splat(0),
 };
 
 /// WASI fd read/write subscription
 pub const SubscriptionFdReadwrite = extern struct {
     fd: i32,
-    _pad: [4]u8 = [_]u8{0} ** 4,
+    _pad: [4]u8 = @splat(0),
 };
 
 /// WASI file descriptor
