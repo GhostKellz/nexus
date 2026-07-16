@@ -4,7 +4,6 @@ const hpack = @import("hpack.zig");
 
 /// HTTP/3 implementation
 /// RFC 9114 - HTTP/3
-
 pub const Error = error{
     ProtocolError,
     InternalError,
@@ -379,6 +378,9 @@ pub const Connection = struct {
                 .payload = buf[0..len],
             };
             if (frame.encode(self.allocator)) |encoded| {
+                // Best-effort GOAWAY on the control stream during connection
+                // teardown. The QUIC connection is closed unconditionally below,
+                // so a failed GOAWAY write only skips a courtesy notification.
                 _ = stream.write(encoded) catch {};
                 self.allocator.free(encoded);
             } else |_| {}
@@ -454,6 +456,20 @@ test "frame encoding" {
     const result = try Frame.parse(encoded);
     try std.testing.expectEqual(@as(u64, @intFromEnum(FrameType.data)), result.frame.frame_type);
     try std.testing.expectEqualStrings("Hello, HTTP/3!", result.frame.payload);
+}
+
+test "frame parse rejects truncated and oversized frames" {
+    // Truncated varints (empty, and a length prefix with no data) come back as
+    // QUIC decode failures rather than reads past the buffer.
+    try std.testing.expectError(quic.Error.InvalidPacket, Frame.parse(&[_]u8{}));
+    try std.testing.expectError(quic.Error.InvalidPacket, Frame.parse(&[_]u8{0x00}));
+
+    // Frame type 0x00 (DATA) with a declared length of 8 but no payload bytes
+    // must be rejected as a short frame instead of slicing out of bounds.
+    try std.testing.expectError(Error.FrameError, Frame.parse(&[_]u8{ 0x00, 0x08 }));
+
+    // A declared length larger than the buffer is likewise refused.
+    try std.testing.expectError(Error.FrameError, Frame.parse(&[_]u8{ 0x00, 0x04, 0x01, 0x02 }));
 }
 
 test "request initialization" {

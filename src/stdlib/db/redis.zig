@@ -3,7 +3,6 @@ const net = @import("../net/tcp.zig");
 
 /// Redis client implementation using RESP (REdis Serialization Protocol)
 /// Supports Redis 6.0+ protocol
-
 pub const Error = error{
     ConnectionFailed,
     AuthenticationFailed,
@@ -77,6 +76,10 @@ pub const Client = struct {
 
     pub fn deinit(self: *Client) void {
         if (self.connected) {
+            // Best-effort graceful QUIT during teardown. If the write fails the
+            // peer is already gone or the socket is broken; the underlying fd is
+            // closed unconditionally by tcp_client.deinit() below, so the error
+            // is safely ignorable here.
             self.disconnect() catch {};
         }
         self.tcp_client.deinit();
@@ -143,11 +146,11 @@ pub const Client = struct {
         defer cmd.deinit(self.allocator);
 
         // Array header
-        try cmd.writer(self.allocator).print("*{d}\r\n", .{args.len});
+        try cmd.print(self.allocator, "*{d}\r\n", .{args.len});
 
         // Arguments
         for (args) |arg| {
-            try cmd.writer(self.allocator).print("${d}\r\n{s}\r\n", .{ arg.len, arg });
+            try cmd.print(self.allocator, "${d}\r\n{s}\r\n", .{ arg.len, arg });
         }
 
         // Send command
@@ -416,7 +419,9 @@ pub const Client = struct {
         return try self.parseValueAt(buf[0..n], &pos);
     }
 
-    fn parseValueAt(self: *Client, data: []const u8, pos: *usize) !Value {
+    // Explicit error set breaks the inferred-error-set dependency loop with
+    // the mutually-recursive parseArrayAt.
+    fn parseValueAt(self: *Client, data: []const u8, pos: *usize) (Error || std.mem.Allocator.Error || std.fmt.ParseIntError)!Value {
         if (pos.* >= data.len) return Error.InvalidResponse;
 
         const type_byte = data[pos.*];
@@ -467,11 +472,18 @@ pub const Client = struct {
             return Value{ .null_value = {} };
         }
 
+        // Only -1 (RESP null bulk string) is a valid negative length. Any other
+        // negative value is malformed; @intCast of it to usize is illegal
+        // behavior (a safety panic), so reject it before the cast.
+        if (len < 0) return Error.InvalidResponse;
+
         const str_start = pos.*;
         const str_len: usize = @intCast(len);
-        const str_end = str_start + str_len;
 
-        if (str_end > data.len) return Error.InvalidResponse;
+        // Bounds-check without computing str_start + str_len, which could
+        // overflow usize for a hostile length near the integer maximum.
+        if (str_len > data.len - str_start) return Error.InvalidResponse;
+        const str_end = str_start + str_len;
 
         const str = try self.allocator.dupe(u8, data[str_start..str_end]);
         pos.* = str_end + 2; // Skip \r\n after string
@@ -488,7 +500,18 @@ pub const Client = struct {
             return Value{ .null_value = {} };
         }
 
+        // As with bulk strings, only -1 (null array) is a valid negative count;
+        // reject other negatives before @intCast to avoid a safety panic.
+        if (count < 0) return Error.InvalidResponse;
+
         const arr_count: usize = @intCast(count);
+
+        // A RESP array cannot hold more elements than there are remaining bytes
+        // in the buffer (each element needs at least one byte). A declared count
+        // larger than that is a malformed/hostile frame; reject it before
+        // allocating so a tiny message can't amplify into a huge allocation.
+        if (arr_count > data.len - pos.*) return Error.InvalidResponse;
+
         const arr = try self.allocator.alloc(Value, arr_count);
         errdefer {
             for (arr) |*item| {
@@ -518,4 +541,57 @@ test "redis client init" {
     defer client.deinit();
 
     try std.testing.expect(!client.connected);
+}
+
+test "redis RESP parser rejects malformed bulk strings and arrays" {
+    const allocator = std.testing.allocator;
+
+    var client = try Client.init(allocator, ConnectionConfig{ .host = "localhost", .port = 6379 });
+    defer client.deinit();
+
+    // A negative bulk-string length other than -1 must be rejected, not
+    // @intCast into a huge usize (which panics in safe builds).
+    {
+        var pos: usize = 0;
+        try std.testing.expectError(Error.InvalidResponse, client.parseValueAt("$-5\r\n", &pos));
+    }
+
+    // A bulk-string length that runs past the buffer must be rejected without
+    // computing an overflowing str_start + str_len.
+    {
+        var pos: usize = 0;
+        try std.testing.expectError(Error.InvalidResponse, client.parseValueAt("$100\r\nshort\r\n", &pos));
+    }
+
+    // A bulk-string length near the usize maximum must not overflow the bounds
+    // check.
+    {
+        var pos: usize = 0;
+        try std.testing.expectError(Error.InvalidResponse, client.parseValueAt("$9223372036854775807\r\nx\r\n", &pos));
+    }
+
+    // A negative array count other than -1 must be rejected before @intCast.
+    {
+        var pos: usize = 0;
+        try std.testing.expectError(Error.InvalidResponse, client.parseValueAt("*-5\r\n", &pos));
+    }
+
+    // A wildly large array count is a memory-amplification frame: a 16-byte
+    // message must not be allowed to allocate a billion Values.
+    {
+        var pos: usize = 0;
+        try std.testing.expectError(Error.InvalidResponse, client.parseValueAt("*1000000000\r\n", &pos));
+    }
+
+    // A well-formed null bulk string ($-1) and null array (*-1) must still parse.
+    {
+        var pos: usize = 0;
+        const v = try client.parseValueAt("$-1\r\n", &pos);
+        try std.testing.expect(v == .null_value);
+    }
+    {
+        var pos: usize = 0;
+        const v = try client.parseValueAt("*-1\r\n", &pos);
+        try std.testing.expect(v == .null_value);
+    }
 }

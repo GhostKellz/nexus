@@ -9,7 +9,6 @@
 ///   POST   /api/todos      - Create new todo
 ///   PUT    /api/todos/:id  - Update todo
 ///   DELETE /api/todos/:id  - Delete todo
-
 const std = @import("std");
 const nexus = @import("nexus");
 
@@ -29,13 +28,23 @@ const Todo = struct {
     }
 };
 
-// Simple in-memory database for demo
-// In production, use nexus.db.PostgresPool
-var todos_db = std.ArrayList(Todo).init(std.heap.page_allocator);
+// Simple in-memory database for demo. (Persistent storage would use a database
+// driver, which is gated out of the public surface for this release — see
+// NX-011 in docs/advisories/accepted.md.)
+var todos_db: std.ArrayList(Todo) = .empty;
 var next_id: i32 = 1;
+// Monotonic creation marker. std.time.timestamp() was removed in Zig 0.17
+// (wall-clock now requires an std.Io handle); this demo only needs a distinct,
+// increasing value per todo, so a simple counter keeps the example self-contained.
+var created_seq: i64 = 0;
+
+fn nextCreatedAt() i64 {
+    created_seq += 1;
+    return created_seq;
+}
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -44,7 +53,7 @@ pub fn main() !void {
         .id = next_id,
         .title = "Learn Nexus Runtime",
         .completed = false,
-        .created_at = std.time.timestamp(),
+        .created_at = nextCreatedAt(),
     });
     next_id += 1;
 
@@ -52,7 +61,7 @@ pub fn main() !void {
         .id = next_id,
         .title = "Build REST API",
         .completed = true,
-        .created_at = std.time.timestamp(),
+        .created_at = nextCreatedAt(),
     });
     next_id += 1;
 
@@ -74,17 +83,18 @@ pub fn main() !void {
 
     // Middleware
     try server.use(nexus.middleware.logger);
-    try server.use(nexus.middleware.cors(.{}));
+    try server.use(nexus.middleware.cors);
 
-    // Routes
-    try server.get("/api/todos", listTodos);
-    try server.get("/api/todos/:id", getTodo);
-    try server.post("/api/todos", createTodo);
-    try server.put("/api/todos/:id", updateTodo);
-    try server.delete("/api/todos/:id", deleteTodo);
+    // Routes. Per-id endpoints use a `:id` path parameter; the router binds the
+    // matched segment and the handlers read it via req.getParam("id").
+    try server.route("GET", "/api/todos", listTodos);
+    try server.route("GET", "/api/todos/:id", getTodo);
+    try server.route("POST", "/api/todos", createTodo);
+    try server.route("PUT", "/api/todos/:id", updateTodo);
+    try server.route("DELETE", "/api/todos/:id", deleteTodo);
 
     // Health check
-    try server.get("/health", struct {
+    try server.route("GET", "/health", struct {
         fn handler(req: *nexus.http.Request, res: *nexus.http.Response) !void {
             _ = req;
             try res.json(.{ .status = "healthy", .todos_count = todos_db.items.len });
@@ -99,25 +109,25 @@ fn listTodos(req: *nexus.http.Request, res: *nexus.http.Response) !void {
     _ = req;
 
     // Build JSON array
-    var json = std.ArrayList(u8).init(res.allocator);
-    defer json.deinit();
+    var json: std.ArrayList(u8) = .empty;
+    defer json.deinit(res.allocator);
 
-    try json.append('[');
+    try json.append(res.allocator, '[');
 
     for (todos_db.items, 0..) |todo, i| {
         const todo_json = try todo.toJson(res.allocator);
         defer res.allocator.free(todo_json);
 
-        try json.appendSlice(todo_json);
+        try json.appendSlice(res.allocator, todo_json);
         if (i < todos_db.items.len - 1) {
-            try json.append(',');
+            try json.append(res.allocator, ',');
         }
     }
 
-    try json.append(']');
+    try json.append(res.allocator, ']');
 
     _ = try res.setHeader("Content-Type", "application/json");
-    try res.send(try json.toOwnedSlice());
+    try res.send(try json.toOwnedSlice(res.allocator));
 }
 
 // GET /api/todos/:id - Get single todo
@@ -177,7 +187,7 @@ fn createTodo(req: *nexus.http.Request, res: *nexus.http.Response) !void {
         .id = next_id,
         .title = try res.allocator.dupe(u8, title),
         .completed = false,
-        .created_at = std.time.timestamp(),
+        .created_at = nextCreatedAt(),
     };
     next_id += 1;
 

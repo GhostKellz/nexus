@@ -4,7 +4,6 @@ const std = @import("std");
 /// RFC 9000 - QUIC: A UDP-Based Multiplexed and Secure Transport
 /// RFC 9001 - Using TLS to Secure QUIC
 /// RFC 9114 - HTTP/3
-
 pub const Error = error{
     InvalidPacket,
     InvalidFrame,
@@ -93,9 +92,10 @@ pub const ConnectionId = struct {
         return cid;
     }
 
-    pub fn generate() ConnectionId {
+    pub fn generate() !ConnectionId {
         var cid = ConnectionId{ .len = 8 };
-        std.crypto.random.bytes(cid.data[0..8]);
+        const io = std.Io.Threaded.global_single_threaded.io();
+        try io.randomSecure(cid.data[0..8]);
         return cid;
     }
 
@@ -122,7 +122,9 @@ pub const VarInt = struct {
         if (data.len == 0) return Error.InvalidPacket;
 
         const prefix = data[0] >> 6;
-        const len: usize = @as(usize, 1) << prefix;
+        // `prefix` is in the range 0..=3 (top two bits), but its u8 type is
+        // too wide for a usize shift amount (which requires a u6). Narrow it.
+        const len: usize = @as(usize, 1) << @as(u6, @intCast(prefix));
 
         if (data.len < len) return Error.InvalidPacket;
 
@@ -461,7 +463,7 @@ pub const Connection = struct {
         };
 
         // Generate initial local connection ID
-        const local_cid = ConnectionId.generate();
+        const local_cid = try ConnectionId.generate();
         try conn.local_cids.append(local_cid);
 
         return conn;
@@ -679,8 +681,20 @@ test "varint decoding" {
     try std.testing.expectEqual(@as(usize, 2), result2.len);
 }
 
+test "varint decoding rejects truncated input" {
+    // Empty input has no length prefix at all.
+    try std.testing.expectError(Error.InvalidPacket, VarInt.decode(&[_]u8{}));
+
+    // The 0x40 prefix promises a 2-byte varint but only 1 byte is present;
+    // decoding must fail rather than read past the slice.
+    try std.testing.expectError(Error.InvalidPacket, VarInt.decode(&[_]u8{0x40}));
+
+    // 0xc0 promises an 8-byte varint; a 3-byte buffer is short.
+    try std.testing.expectError(Error.InvalidPacket, VarInt.decode(&[_]u8{ 0xc0, 0x00, 0x00 }));
+}
+
 test "connection id" {
-    const cid1 = ConnectionId.generate();
+    const cid1 = try ConnectionId.generate();
     try std.testing.expectEqual(@as(u8, 8), cid1.len);
 
     const cid2 = ConnectionId.init("test1234");

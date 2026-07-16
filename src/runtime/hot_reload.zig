@@ -3,7 +3,6 @@ const builtin = @import("builtin");
 
 /// Hot reload system for development
 /// Watches files for changes and triggers recompilation
-
 pub const Error = error{
     WatcherInitFailed,
     InvalidPath,
@@ -114,10 +113,9 @@ pub const FileWatcher = struct {
                 callback(changed);
             }
 
-            const ns_total = self.poll_interval_ms * std.time.ns_per_ms;
-            const seconds = ns_total / std.time.ns_per_s;
-            const nanoseconds = ns_total % std.time.ns_per_s;
-            std.posix.nanosleep(seconds, nanoseconds);
+            const duration = std.Io.Duration.fromMilliseconds(@intCast(self.poll_interval_ms));
+            const timeout = std.Io.Timeout{ .duration = .{ .raw = duration, .clock = .awake } };
+            timeout.sleep(self.io) catch {};
         }
     }
 };
@@ -273,6 +271,9 @@ pub const HotReloadManager = struct {
 
             const duration = std.Io.Duration.fromMilliseconds(@intCast(self.watcher.poll_interval_ms));
             const timeout = std.Io.Timeout{ .duration = .{ .raw = duration, .clock = .awake } };
+            // Best-effort debounce between poll cycles. A cancelled/failed sleep
+            // only makes the next stat() happen sooner, which is harmless, so the
+            // watch loop deliberately ignores the error and keeps polling.
             timeout.sleep(self.io) catch {};
         }
     }
@@ -281,7 +282,8 @@ pub const HotReloadManager = struct {
 test "hot reload file watcher" {
     const allocator = std.testing.allocator;
 
-    var watcher = FileWatcher.init(allocator);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var watcher = FileWatcher.init(allocator, io);
     defer watcher.deinit();
 
     // Test would add actual files in real scenario

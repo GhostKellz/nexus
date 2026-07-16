@@ -1,5 +1,6 @@
 const std = @import("std");
 const nexus = @import("nexus");
+const scaffold = @import("scaffold");
 const Dir = std.Io.Dir;
 const Io = std.Io;
 
@@ -31,8 +32,7 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
 
     // Welcome message
-    nexus.console.info("⚡ Nexus Runtime v0.1.0", .{});
-    nexus.console.info("Node.js reimagined in Zig + WASM", .{});
+    nexus.console.info("⚡ Nexus Runtime v{s}", .{nexus.version});
     nexus.console.info("", .{});
 
     // Get command line arguments
@@ -70,12 +70,15 @@ pub fn main(init: std.process.Init) !void {
         try buildProject(allocator, init.io, release);
     } else if (std.mem.eql(u8, command, "deploy")) {
         const target = if (args.len >= 3) args[2] else "production";
-        try deployProject(allocator, target);
+        try deployProject(target);
     } else if (std.mem.eql(u8, command, "serve")) {
         try runHttpServer(allocator);
     } else if (std.mem.eql(u8, command, "test")) {
-        nexus.console.info("Running tests...", .{});
-        nexus.console.info("✓ Test runner not yet implemented", .{});
+        // No test runner exists. The prior behaviour printed a green
+        // "✓ Test runner not yet implemented" and exited 0, so scripts and CI
+        // read a success where nothing ran. Report the truth and exit nonzero.
+        nexus.console.@"error"("'nexus test' is not implemented; run `zig build test`", .{});
+        return error.UnsupportedCommand;
     } else if (std.mem.eql(u8, command, "version") or std.mem.eql(u8, command, "--version")) {
         printVersion();
     } else if (std.mem.eql(u8, command, "help") or std.mem.eql(u8, command, "--help")) {
@@ -93,45 +96,31 @@ fn printUsage() void {
     nexus.console.println("", .{});
     nexus.console.println("Commands:", .{});
     nexus.console.println("  init [name]         Create a new Nexus project", .{});
-    nexus.console.println("  dev [port]          Start development server with hot reload", .{});
-    nexus.console.println("  build [--release]   Build project for production", .{});
-    nexus.console.println("  deploy [target]     Deploy to production", .{});
-    nexus.console.println("  run <file>          Run a Zig file with Nexus runtime", .{});
-    nexus.console.println("  serve               Start a demo HTTP server", .{});
-    nexus.console.println("  test                Run tests", .{});
+    nexus.console.println("  dev [port]          Start the dev server with hot reload (default 3000)", .{});
+    nexus.console.println("  build [--release]   Build the project with `zig build`", .{});
+    nexus.console.println("  run <file.zig>      Run a Zig file (.wasm/.wat fail closed)", .{});
+    nexus.console.println("  serve               Start a built-in demo HTTP server on port 3000", .{});
+    nexus.console.println("  test                Not implemented; use `zig build test` (fails closed)", .{});
+    nexus.console.println("  deploy              Not implemented; ship ./zig-out/bin/ yourself (fails closed)", .{});
     nexus.console.println("  version             Print version information", .{});
     nexus.console.println("  help                Print this help message", .{});
     nexus.console.println("", .{});
     nexus.console.println("Examples:", .{});
-    nexus.console.println("  nexus init my-app      # Create new project", .{});
-    nexus.console.println("  nexus dev --port 8080  # Dev server on port 8080", .{});
-    nexus.console.println("  nexus build --release  # Production build", .{});
-    nexus.console.println("  nexus deploy aws       # Deploy to AWS", .{});
-    nexus.console.println("  nexus run app.zig      # Run a file", .{});
+    nexus.console.println("  nexus init my-app       # Create new project", .{});
+    nexus.console.println("  nexus dev 8080          # Dev server on port 8080", .{});
+    nexus.console.println("  nexus build --release   # Production build", .{});
+    nexus.console.println("  nexus run app.zig       # Run a Zig file", .{});
     nexus.console.println("", .{});
 }
 
 fn printVersion() void {
     nexus.console.println("", .{});
-    nexus.console.println("Nexus Runtime v0.1.0", .{});
+    nexus.console.println("Nexus Runtime v{s}", .{nexus.version});
+    nexus.console.println("Linux-only, pre-1.0 and unstable.", .{});
     nexus.console.println("", .{});
-    nexus.console.println("Features:", .{});
-    nexus.console.println("  ✓ Event loop (epoll/kqueue/IOCP)", .{});
-    nexus.console.println("  ✓ HTTP/1.1 server", .{});
-    nexus.console.println("  ✓ WebSocket support", .{});
-    nexus.console.println("  ✓ WASM runtime", .{});
-    nexus.console.println("  ✓ WASI support", .{});
-    nexus.console.println("  ✓ File system operations", .{});
-    nexus.console.println("  ✓ TCP/UDP networking", .{});
-    nexus.console.println("  ✓ Streams API", .{});
-    nexus.console.println("  ✓ Module system", .{});
-    nexus.console.println("  ✓ Security policies", .{});
-    nexus.console.println("", .{});
-    nexus.console.println("Performance (target):", .{});
-    nexus.console.println("  HTTP req/s:  500k+ (10x vs Node.js)", .{});
-    nexus.console.println("  Cold start:  <5ms (10x vs Node.js)", .{});
-    nexus.console.println("  Memory:      ~5MB (10x vs Node.js)", .{});
-    nexus.console.println("  Binary size: ~5MB (10x vs Node.js)", .{});
+    // Per-capability status is tracked in the docs so this output cannot drift
+    // out of sync with what actually works.
+    nexus.console.println("Capability status: docs/README.md#capability-status", .{});
     nexus.console.println("", .{});
 }
 
@@ -176,36 +165,18 @@ fn runWasmFile(allocator: std.mem.Allocator, io: Io, file_path: []const u8) !voi
         return error.InvalidWasmFile;
     }
 
-    nexus.console.info("✓ WASM module loaded ({d} bytes)", .{wasm_bytes.len});
-
-    // Initialize WASM engine
-    var instance = nexus.wasm.Instance.init(allocator);
-    defer instance.deinit();
-
-    // Set up WASI imports if needed
-    nexus.console.info("Initializing WASI environment...", .{});
-
-    // Try to call _start (WASI entry point) or main
-    if (instance.getFunction("_start")) |_| {
-        nexus.console.info("Calling _start...", .{});
-        _ = instance.call("_start", &[_]nexus.wasm.Value{}) catch |err| {
-            nexus.console.@"error"("Execution failed: {s}", .{@errorName(err)});
-            return err;
-        };
-        nexus.console.info("✓ Execution complete", .{});
-    } else if (instance.getFunction("main")) |_| {
-        nexus.console.info("Calling main...", .{});
-        const result = instance.call("main", &[_]nexus.wasm.Value{}) catch |err| {
-            nexus.console.@"error"("Execution failed: {s}", .{@errorName(err)});
-            return err;
-        };
-        if (result.len > 0) {
-            nexus.console.info("✓ Execution complete (exit code: {d})", .{result[0].toInt(i32)});
-        }
-    } else {
-        nexus.console.@"error"("No entry point found (_start or main)", .{});
-        return error.NoEntryPoint;
-    }
+    // The bytes are a syntactically-plausible WASM module (magic + version),
+    // but the engine has no binary parser: `Module.instantiate` ignores the
+    // bytes and fabricates an empty instance with a hard-coded one-page memory,
+    // so no functions, memories, or WASI imports from the module actually exist.
+    // The prior code went on to print "Initializing WASI environment...",
+    // probe an always-empty instance for `_start`/`main`, and exit with a
+    // confusing `NoEntryPoint`, implying the module had merely lacked an entry
+    // point rather than never being parsed at all. Fail closed with the real
+    // reason: module execution is unsupported until the loader/interpreter can
+    // parse and instantiate a module. (Phase 5 goal, item "nexus run".)
+    nexus.console.@"error"("WASM execution is unsupported: the engine cannot yet parse and instantiate a module ({d} bytes read)", .{wasm_bytes.len});
+    return error.UnsupportedWasmExecution;
 }
 
 /// Run a WAT (WebAssembly Text) file
@@ -220,8 +191,12 @@ fn runWatFile(allocator: std.mem.Allocator, io: Io, file_path: []const u8) !void
     };
     defer allocator.free(wat_source);
 
-    nexus.console.info("✓ WAT source loaded ({d} bytes)", .{wat_source.len});
-    nexus.console.info("WAT execution would require wat2wasm conversion", .{});
+    // Reading the text is not running it: there is no in-tree WAT assembler, so
+    // the module is never converted to WASM or executed. The prior code printed
+    // a green "✓ WAT source loaded" and returned success, masking that nothing
+    // ran. Fail closed with a precise, nonzero error instead.
+    nexus.console.@"error"("WAT execution is unsupported: no in-tree wat2wasm assembler ({d} bytes read)", .{wat_source.len});
+    return error.UnsupportedFileType;
 }
 
 /// Run a Zig file (compile and execute)
@@ -362,31 +337,17 @@ fn handleRoot(req: *nexus.http.Request, res: *nexus.http.Response) !void {
         \\<body>
         \\    <div class="container">
         \\        <h1>⚡ Nexus</h1>
-        \\        <p class="tagline">Node.js reimagined in Zig + WASM</p>
-        \\        <p><strong>10x faster • 10x smaller • Infinitely more powerful</strong></p>
-        \\
-        \\        <div class="stats">
-        \\            <h3>🚀 Performance Targets</h3>
-        \\            <ul>
-        \\                <li><strong>500k+</strong> HTTP requests/sec (vs Node.js: 50k)</li>
-        \\                <li><strong>&lt;5ms</strong> cold start (vs Node.js: 50ms)</li>
-        \\                <li><strong>~5MB</strong> memory usage (vs Node.js: 50MB)</li>
-        \\                <li><strong>~5MB</strong> binary size (vs Node.js: 50MB)</li>
-        \\            </ul>
-        \\        </div>
+        \\        <p class="tagline">A Zig runtime for HTTP services (pre-1.0, Linux-only).</p>
         \\
         \\        <h2>✨ Features</h2>
         \\        <div class="feature-grid">
-        \\            <div class="feature">✓ Event loop (epoll/kqueue)</div>
-        \\            <div class="feature">✓ HTTP/1.1 server</div>
-        \\            <div class="feature">✓ WebSocket support</div>
-        \\            <div class="feature">✓ WASM runtime</div>
-        \\            <div class="feature">✓ WASI support</div>
-        \\            <div class="feature">✓ File system ops</div>
-        \\            <div class="feature">✓ TCP/UDP networking</div>
-        \\            <div class="feature">✓ Streams API</div>
-        \\            <div class="feature">✓ Module system</div>
-        \\            <div class="feature">✓ Security policies</div>
+        \\            <div class="feature">Event loop (epoll)</div>
+        \\            <div class="feature">HTTP/1.1 server</div>
+        \\            <div class="feature">WebSocket support</div>
+        \\            <div class="feature">File system ops</div>
+        \\            <div class="feature">TCP networking</div>
+        \\            <div class="feature">Streams API</div>
+        \\            <div class="feature">Module system</div>
         \\        </div>
         \\
         \\        <h2>📡 API Endpoints</h2>
@@ -400,8 +361,7 @@ fn handleRoot(req: *nexus.http.Request, res: *nexus.http.Response) !void {
         \\
         \\        <p>
         \\            <a href="https://github.com/ghostkellz/nexus">GitHub</a> •
-        \\            <a href="/api/status">API Status</a> •
-        \\            <a href="https://docs.nexus.dev">Documentation</a>
+        \\            <a href="/api/status">API Status</a>
         \\        </p>
         \\    </div>
         \\</body>
@@ -415,7 +375,7 @@ fn handleStatus(req: *nexus.http.Request, res: *nexus.http.Response) !void {
     _ = req;
 
     try res.json(.{
-        .runtime = "Nexus v0.1.0",
+        .runtime = "Nexus v" ++ nexus.version,
         .language = "Zig",
         .status = "running",
         .uptime = if (runtime_io) |io| getUptimeSeconds(io) else 0,
@@ -423,172 +383,36 @@ fn handleStatus(req: *nexus.http.Request, res: *nexus.http.Response) !void {
             "event_loop",
             "http_server",
             "websocket",
-            "wasm",
-            "wasi",
             "streams",
-            "tcp_udp",
+            "tcp",
             "file_system",
-        },
-        .performance = .{
-            .target_req_per_sec = 500000,
-            .target_cold_start_ms = 5,
-            .target_memory_mb = 5,
+            "module_system",
         },
     });
 }
 
-/// Initialize a new Nexus project
+/// Initialize a new Nexus project.
+///
+/// The project files are produced by the shared `scaffold` generator so that
+/// the `nexus init` output and the generated-project contract test stay byte
+/// identical. The CLI wires the conventional sibling dependency path
+/// (`../nexus`); the generated `build.zig.zon` documents how to adjust it.
 fn initProject(allocator: std.mem.Allocator, io: std.Io, name: []const u8) !void {
     nexus.console.info("🚀 Creating new Nexus project: {s}", .{name});
 
-    const cwd = std.Io.Dir.cwd();
-
-    // Create project directory
-    cwd.createDir(io, name, .default_dir) catch |err| {
-        if (err != error.PathAlreadyExists) return err;
-        nexus.console.warn("Directory '{s}' already exists", .{name});
-    };
-
-    // Create subdirectories
-    const dirs = [_][]const u8{ "src", "static", "tests" };
-    for (dirs) |dir| {
-        const full_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ name, dir });
-        defer allocator.free(full_path);
-        cwd.createDir(io, full_path, .default_dir) catch |err| {
-            if (err != error.PathAlreadyExists) return err;
-        };
-    }
-
-    // Create main.zig
-    const main_zig_path = try std.fmt.allocPrint(allocator, "{s}/src/main.zig", .{name});
-    defer allocator.free(main_zig_path);
-
-    const main_content =
-        \\const std = @import("std");
-        \\const nexus = @import("nexus");
-        \\
-        \\pub fn main() !void {
-        \\    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-        \\    defer _ = gpa.deinit();
-        \\    const allocator = gpa.allocator();
-        \\
-        \\    // Create HTTP server
-        \\    var server = try nexus.http.Server.init(allocator, .{
-        \\        .port = 3000,
-        \\        .host = "0.0.0.0",
-        \\    });
-        \\    defer server.deinit();
-        \\
-        \\    // Add middleware
-        \\    try server.use(nexus.middleware.logger);
-        \\    try server.use(nexus.middleware.cors);
-        \\
-        \\    // Define routes
-        \\    try server.get("/", handleHome);
-        \\    try server.get("/api/hello", handleHello);
-        \\
-        \\    nexus.console.log("🚀 Server running on http://localhost:3000");
-        \\    try server.listen();
-        \\}
-        \\
-        \\fn handleHome(req: *nexus.http.Request, res: *nexus.http.Response) !void {
-        \\    _ = req;
-        \\    try res.html("<h1>Welcome to Nexus!</h1>");
-        \\}
-        \\
-        \\fn handleHello(req: *nexus.http.Request, res: *nexus.http.Response) !void {
-        \\    _ = req;
-        \\    try res.json(.{ .message = "Hello from Nexus!" });
-        \\}
-        \\
-    ;
-
-    try cwd.writeFile(io, .{ .sub_path = main_zig_path, .data = main_content });
-
-    // Create build.zig
-    const build_path = try std.fmt.allocPrint(allocator, "{s}/build.zig", .{name});
-    defer allocator.free(build_path);
-
-    const build_content =
-        \\const std = @import("std");
-        \\
-        \\pub fn build(b: *std.Build) void {
-        \\    const target = b.standardTargetOptions(.{});
-        \\    const optimize = b.standardOptimizeOption(.{});
-        \\
-        \\    const exe = b.addExecutable(.{
-        \\        .name = "app",
-        \\        .root_source_file = b.path("src/main.zig"),
-        \\        .target = target,
-        \\        .optimize = optimize,
-        \\    });
-        \\
-        \\    // Add nexus module (adjust path to your nexus installation)
-        \\    const nexus_mod = b.addModule("nexus", .{
-        \\        .root_source_file = b.path("../nexus/src/root.zig"),
-        \\    });
-        \\    exe.root_module.addImport("nexus", nexus_mod);
-        \\
-        \\    b.installArtifact(exe);
-        \\}
-        \\
-    ;
-
-    try cwd.writeFile(io, .{ .sub_path = build_path, .data = build_content });
-
-    // Create README
-    const readme_path = try std.fmt.allocPrint(allocator, "{s}/README.md", .{name});
-    defer allocator.free(readme_path);
-
-    const readme_content = try std.fmt.allocPrint(allocator,
-        \\# {s}
-        \\
-        \\A Nexus runtime application.
-        \\
-        \\## Getting Started
-        \\
-        \\```bash
-        \\# Development server with hot reload
-        \\nexus dev
-        \\
-        \\# Build for production
-        \\nexus build --release
-        \\
-        \\# Run tests
-        \\nexus test
-        \\```
-        \\
-        \\## Project Structure
-        \\
-        \\```
-        \\{s}/
-        \\├── src/
-        \\│   └── main.zig      # Application entry point
-        \\├── static/           # Static assets
-        \\├── tests/            # Test files
-        \\├── build.zig         # Build configuration
-        \\└── README.md         # This file
-        \\```
-        \\
-        \\## Documentation
-        \\
-        \\- [Nexus Documentation](https://docs.nexus.dev)
-        \\- [Zig Language](https://ziglang.org/documentation/master/)
-        \\
-    , .{ name, name });
-    defer allocator.free(readme_content);
-
-    try cwd.writeFile(io, .{ .sub_path = readme_path, .data = readme_content });
+    try scaffold.create(std.Io.Dir.cwd(), allocator, io, name, "../nexus");
 
     nexus.console.info("✓ Created {s}/src/main.zig", .{name});
     nexus.console.info("✓ Created {s}/build.zig", .{name});
+    nexus.console.info("✓ Created {s}/build.zig.zon", .{name});
     nexus.console.info("✓ Created {s}/README.md", .{name});
     nexus.console.info("", .{});
     nexus.console.info("🎉 Project initialized successfully!", .{});
     nexus.console.info("", .{});
     nexus.console.info("Next steps:", .{});
     nexus.console.info("  cd {s}", .{name});
-    nexus.console.info("  nexus dev", .{});
+    nexus.console.info("  # edit build.zig.zon so .nexus .path points at your Nexus checkout", .{});
+    nexus.console.info("  zig build run", .{});
     nexus.console.info("", .{});
 }
 
@@ -649,35 +473,12 @@ fn buildProject(allocator: std.mem.Allocator, io: std.Io, release: bool) !void {
     nexus.console.info("", .{});
 }
 
-/// Deploy project to target environment
-fn deployProject(allocator: std.mem.Allocator, target: []const u8) !void {
-    _ = allocator;
-
-    nexus.console.info("🚀 Deploying to: {s}", .{target});
-    nexus.console.info("", .{});
-
-    if (std.mem.eql(u8, target, "aws")) {
-        nexus.console.info("Deployment targets:", .{});
-        nexus.console.info("  • AWS Lambda", .{});
-        nexus.console.info("  • AWS ECS", .{});
-        nexus.console.info("  • AWS EC2", .{});
-    } else if (std.mem.eql(u8, target, "docker")) {
-        nexus.console.info("Building Docker container...", .{});
-        nexus.console.info("  FROM scratch", .{});
-        nexus.console.info("  COPY zig-out/bin/app /app", .{});
-        nexus.console.info("  ENTRYPOINT [\"/app\"]", .{});
-    } else if (std.mem.eql(u8, target, "fly")) {
-        nexus.console.info("Deploying to Fly.io...", .{});
-    } else {
-        nexus.console.info("Deploying to: {s}", .{target});
-    }
-
-    nexus.console.info("", .{});
-    nexus.console.warn("⚠ Deployment not fully implemented yet", .{});
-    nexus.console.info("", .{});
-    nexus.console.info("Manual deployment:", .{});
-    nexus.console.info("  1. Build with: nexus build --release", .{});
-    nexus.console.info("  2. Upload binary from: ./zig-out/bin/", .{});
-    nexus.console.info("  3. Run on server", .{});
-    nexus.console.info("", .{});
+/// Deployment automation is not implemented. The prior body printed a fake
+/// target menu (AWS/Docker/Fly) and a success message while doing nothing, so a
+/// caller reading the exit code saw a deploy that never happened as success.
+/// Fail closed and point at the real manual path instead.
+fn deployProject(target: []const u8) !void {
+    nexus.console.@"error"("'nexus deploy' is not implemented (target: {s})", .{target});
+    nexus.console.info("Build with `nexus build --release`, then ship ./zig-out/bin/ yourself.", .{});
+    return error.UnsupportedCommand;
 }

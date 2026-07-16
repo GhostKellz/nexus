@@ -1,6 +1,25 @@
 const std = @import("std");
 const tcp = @import("tcp.zig");
 
+/// Minimal byte sink over an unmanaged `std.ArrayList(u8)`.
+///
+/// `std.ArrayList` is now unmanaged and no longer provides a `.writer()`
+/// method, so this adapter supplies the `writeByte`/`writeAll` surface the
+/// generic Protobuf encoders (which take `writer: anytype`) expect, appending
+/// straight into the backing list.
+const ArrayListWriter = struct {
+    list: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+
+    fn writeByte(self: ArrayListWriter, byte: u8) !void {
+        try self.list.append(self.allocator, byte);
+    }
+
+    fn writeAll(self: ArrayListWriter, bytes: []const u8) !void {
+        try self.list.appendSlice(self.allocator, bytes);
+    }
+};
+
 /// gRPC service method handler
 pub const MethodHandler = *const fn (request: []const u8, allocator: std.mem.Allocator) anyerror![]u8;
 
@@ -49,8 +68,13 @@ pub const Server = struct {
 
     /// Register a gRPC method
     pub fn registerMethod(self: *Server, name: []const u8, handler: MethodHandler) !void {
+        const name_copy = try self.allocator.dupe(u8, name);
+        // If the append below fails, ownership of name_copy never transfers to
+        // the methods list, so free it here rather than leaking it.
+        errdefer self.allocator.free(name_copy);
+
         const method = Method{
-            .name = try self.allocator.dupe(u8, name),
+            .name = name_copy,
             .handler = handler,
             .allocator = self.allocator,
         };
@@ -133,8 +157,8 @@ pub const Protobuf = struct {
         varint = 0,
         fixed64 = 1,
         length_delimited = 2,
-        start_group = 3,  // Deprecated
-        end_group = 4,    // Deprecated
+        start_group = 3, // Deprecated
+        end_group = 4, // Deprecated
         fixed32 = 5,
     };
 
@@ -151,13 +175,17 @@ pub const Protobuf = struct {
     /// Decode a varint
     pub fn decodeVarint(data: []const u8, offset: *usize) !u64 {
         var result: u64 = 0;
-        var shift: u6 = 0;
+        // Track the shift in a wide type: a u6 (the shift width for a u64) tops
+        // out at 63, so `shift += 7` past the 9th continuation byte would
+        // overflow and panic before the `shift >= 64` guard could reject the
+        // oversized varint. Keeping the counter in a u32 lets the guard fire.
+        var shift: u32 = 0;
 
         while (offset.* < data.len) {
             const byte = data[offset.*];
             offset.* += 1;
 
-            result |= @as(u64, byte & 0x7F) << shift;
+            result |= @as(u64, byte & 0x7F) << @intCast(shift);
 
             if ((byte & 0x80) == 0) {
                 return result;
@@ -191,21 +219,38 @@ pub const Protobuf = struct {
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(allocator);
 
-        // Get field information from the struct
-        inline for (@typeInfo(@TypeOf(fields)).@"struct".fields, 1..) |field, field_num| {
-            const field_value = @field(fields, field.name);
-            const field_type = @typeInfo(field.type);
+        const writer = ArrayListWriter{ .list = &buf, .allocator = allocator };
+
+        // Get field information from the struct. The pinned std exposes struct
+        // reflection as parallel `field_names`/`field_types` arrays rather than
+        // a single `fields` array of `{ name, type }`.
+        const struct_info = @typeInfo(@TypeOf(fields)).@"struct";
+        inline for (struct_info.field_names, struct_info.field_types, 1..) |field_name, field_type_t, field_num| {
+            const field_value = @field(fields, field_name);
+            const field_type = @typeInfo(field_type_t);
 
             switch (field_type) {
                 .pointer => |ptr| {
                     if (ptr.child == u8) {
-                        // String field
-                        try encodeString(@intCast(field_num), field_value, buf.writer(allocator));
+                        // Slice string field ([]const u8)
+                        try encodeString(@intCast(field_num), field_value, writer);
+                    } else if (@typeInfo(ptr.child) == .array and
+                        @typeInfo(ptr.child).array.child == u8)
+                    {
+                        // String literal: *const [N:0]u8 — coerce to a slice.
+                        const slice: []const u8 = field_value;
+                        try encodeString(@intCast(field_num), slice, writer);
                     }
                 },
-                .int => {
+                .array => |arr| {
+                    if (arr.child == u8) {
+                        const slice: []const u8 = &field_value;
+                        try encodeString(@intCast(field_num), slice, writer);
+                    }
+                },
+                .int, .comptime_int => {
                     // Integer field
-                    try encodeInt32(@intCast(field_num), @intCast(field_value), buf.writer(allocator));
+                    try encodeInt32(@intCast(field_num), @intCast(field_value), writer);
                 },
                 else => {},
             }
@@ -221,7 +266,7 @@ test "protobuf varint encoding" {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
 
-    try Protobuf.encodeVarint(150, buf.writer(allocator));
+    try Protobuf.encodeVarint(150, ArrayListWriter{ .list = &buf, .allocator = allocator });
 
     // 150 = 0b10010110 = 0x96
     // Varint: 10010110 00000001 = 0x96 0x01
@@ -240,4 +285,19 @@ test "protobuf message building" {
 
     // Should have encoded field 1 (string "test") and field 2 (int 42)
     try std.testing.expect(message.len > 0);
+}
+
+test "protobuf decodeVarint rejects truncated input" {
+    // A byte with the continuation bit set but no following byte must not read
+    // past the buffer.
+    var offset: usize = 0;
+    try std.testing.expectError(error.UnexpectedEof, Protobuf.decodeVarint(&[_]u8{0x80}, &offset));
+}
+
+test "protobuf decodeVarint rejects oversized varint" {
+    // Ten continuation bytes exceed the 64-bit range. This must return
+    // VarintTooLarge rather than overflowing the shift counter and panicking.
+    var offset: usize = 0;
+    const oversized = [_]u8{ 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80 };
+    try std.testing.expectError(error.VarintTooLarge, Protobuf.decodeVarint(&oversized, &offset));
 }

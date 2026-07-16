@@ -13,6 +13,11 @@ pub const Module = struct {
     type: ModuleType,
     exports: std.StringHashMap(*anyopaque),
     allocator: std.mem.Allocator,
+    /// Open handle for `.dynamic` modules. Any function pointer stored in
+    /// `exports` (or returned from a lookup) points into this loaded image and
+    /// is valid only while the handle is open, so the handle must live for the
+    /// whole module lifetime and is closed last in `deinit`.
+    dyn_lib: ?std.DynLib = null,
 
     pub fn init(allocator: std.mem.Allocator, path: []const u8, module_type: ModuleType) !Module {
         return Module{
@@ -26,6 +31,11 @@ pub const Module = struct {
     pub fn deinit(self: *Module) void {
         self.allocator.free(self.path);
         self.exports.deinit();
+        // Close after exports so no borrowed function pointer is used post-unmap.
+        if (self.dyn_lib) |*lib| {
+            lib.close();
+            self.dyn_lib = null;
+        }
     }
 };
 
@@ -64,8 +74,9 @@ pub const ModuleResolver = struct {
         try self.search_paths.append(self.allocator, duped);
     }
 
-    /// Resolve module specifier to absolute path
-    pub fn resolve(self: *ModuleResolver, specifier: []const u8, parent: ?[]const u8) !ResolveResult {
+    /// Resolve module specifier to absolute path. `io` is required because
+    /// resolution probes the filesystem (`fileExists`) via `std.Io.Dir`.
+    pub fn resolve(self: *ModuleResolver, io: std.Io, specifier: []const u8, parent: ?[]const u8) !ResolveResult {
         // 1. Built-in modules (nexus:*)
         if (std.mem.startsWith(u8, specifier, "nexus:")) {
             return self.resolveBuiltin(specifier);
@@ -75,16 +86,16 @@ pub const ModuleResolver = struct {
         if (std.mem.startsWith(u8, specifier, "./") or
             std.mem.startsWith(u8, specifier, "../"))
         {
-            return self.resolveRelative(specifier, parent);
+            return self.resolveRelative(io, specifier, parent);
         }
 
         // 3. Absolute paths
         if (std.fs.path.isAbsolute(specifier)) {
-            return self.resolveAbsolute(specifier);
+            return self.resolveAbsolute(io, specifier);
         }
 
         // 4. Package resolution (node_modules style)
-        return self.resolvePackage(specifier, parent);
+        return self.resolvePackage(io, specifier, parent);
     }
 
     fn resolveBuiltin(self: *ModuleResolver, specifier: []const u8) !ResolveResult {
@@ -97,7 +108,7 @@ pub const ModuleResolver = struct {
         };
     }
 
-    fn resolveRelative(self: *ModuleResolver, specifier: []const u8, parent: ?[]const u8) !ResolveResult {
+    fn resolveRelative(self: *ModuleResolver, io: std.Io, specifier: []const u8, parent: ?[]const u8) !ResolveResult {
         const parent_dir = if (parent) |p|
             std.fs.path.dirname(p) orelse "."
         else
@@ -107,7 +118,7 @@ pub const ModuleResolver = struct {
         errdefer self.allocator.free(resolved);
 
         // Try exact path
-        if (try self.fileExists(resolved)) {
+        if (try self.fileExists(io, resolved)) {
             return ResolveResult{
                 .path = resolved,
                 .type = try self.detectType(resolved),
@@ -119,7 +130,7 @@ pub const ModuleResolver = struct {
         const zig_path = try std.fmt.allocPrint(self.allocator, "{s}.zig", .{resolved});
         defer self.allocator.free(zig_path);
 
-        if (try self.fileExists(zig_path)) {
+        if (try self.fileExists(io, zig_path)) {
             self.allocator.free(resolved);
             return ResolveResult{
                 .path = try self.allocator.dupe(u8, zig_path),
@@ -132,7 +143,7 @@ pub const ModuleResolver = struct {
         const wasm_path = try std.fmt.allocPrint(self.allocator, "{s}.wasm", .{resolved});
         defer self.allocator.free(wasm_path);
 
-        if (try self.fileExists(wasm_path)) {
+        if (try self.fileExists(io, wasm_path)) {
             self.allocator.free(resolved);
             return ResolveResult{
                 .path = try self.allocator.dupe(u8, wasm_path),
@@ -145,8 +156,8 @@ pub const ModuleResolver = struct {
         return error.ModuleNotFound;
     }
 
-    fn resolveAbsolute(self: *ModuleResolver, specifier: []const u8) !ResolveResult {
-        if (try self.fileExists(specifier)) {
+    fn resolveAbsolute(self: *ModuleResolver, io: std.Io, specifier: []const u8) !ResolveResult {
+        if (try self.fileExists(io, specifier)) {
             return ResolveResult{
                 .path = try self.allocator.dupe(u8, specifier),
                 .type = try self.detectType(specifier),
@@ -156,7 +167,7 @@ pub const ModuleResolver = struct {
         return error.ModuleNotFound;
     }
 
-    fn resolvePackage(self: *ModuleResolver, specifier: []const u8, parent: ?[]const u8) !ResolveResult {
+    fn resolvePackage(self: *ModuleResolver, io: std.Io, specifier: []const u8, parent: ?[]const u8) !ResolveResult {
         // Search node_modules-style directories
         var current_dir = if (parent) |p| std.fs.path.dirname(p) orelse "." else ".";
 
@@ -167,7 +178,7 @@ pub const ModuleResolver = struct {
             );
             defer self.allocator.free(node_modules);
 
-            if (try self.fileExists(node_modules)) {
+            if (try self.fileExists(io, node_modules)) {
                 return ResolveResult{
                     .path = try self.allocator.dupe(u8, node_modules),
                     .type = try self.detectType(node_modules),
@@ -179,7 +190,7 @@ pub const ModuleResolver = struct {
             const zig_path = try std.fmt.allocPrint(self.allocator, "{s}.zig", .{node_modules});
             defer self.allocator.free(zig_path);
 
-            if (try self.fileExists(zig_path)) {
+            if (try self.fileExists(io, zig_path)) {
                 return ResolveResult{
                     .path = try self.allocator.dupe(u8, zig_path),
                     .type = .native,
@@ -198,9 +209,9 @@ pub const ModuleResolver = struct {
         return error.ModuleNotFound;
     }
 
-    fn fileExists(self: *ModuleResolver, path: []const u8) !bool {
+    fn fileExists(self: *ModuleResolver, io: std.Io, path: []const u8) !bool {
         _ = self;
-        std.fs.cwd().access(path, .{}) catch |err| {
+        std.Io.Dir.cwd().access(io, path, .{}) catch |err| {
             if (err == error.FileNotFound) return false;
             return err;
         };
@@ -247,7 +258,8 @@ pub const ModuleCache = struct {
     }
 
     pub fn remove(self: *ModuleCache, path: []const u8) ?*Module {
-        return self.cache.fetchRemove(path);
+        if (self.cache.fetchRemove(path)) |kv| return kv.value;
+        return null;
     }
 };
 
@@ -270,9 +282,9 @@ pub const ModuleLoader = struct {
         self.cache.deinit();
     }
 
-    pub fn load(self: *ModuleLoader, specifier: []const u8, parent: ?[]const u8) !*Module {
+    pub fn load(self: *ModuleLoader, io: std.Io, specifier: []const u8, parent: ?[]const u8) !*Module {
         // Resolve module path
-        var resolved = try self.resolver.resolve(specifier, parent);
+        var resolved = try self.resolver.resolve(io, specifier, parent);
         defer resolved.deinit();
 
         // Check cache
@@ -285,10 +297,13 @@ pub const ModuleLoader = struct {
         errdefer self.allocator.destroy(module);
 
         module.* = try Module.init(self.allocator, resolved.path, resolved.type);
+        // If a loader below fails, release the module's owned resources (path,
+        // exports map, dyn_lib) before freeing the struct itself.
+        errdefer module.deinit();
 
         switch (resolved.type) {
             .native => try self.loadNative(module),
-            .wasm => try self.loadWasm(module),
+            .wasm => try self.loadWasm(io, module),
             .dynamic => try self.loadDynamic(module),
         }
 
@@ -306,12 +321,13 @@ pub const ModuleLoader = struct {
         _ = module;
     }
 
-    fn loadWasm(self: *ModuleLoader, module: *Module) !void {
+    fn loadWasm(self: *ModuleLoader, io: std.Io, module: *Module) !void {
         // Load WASM module from file
-        const file_content = std.fs.cwd().readFileAlloc(
-            self.allocator,
+        const file_content = std.Io.Dir.cwd().readFileAlloc(
+            io,
             module.path,
-            10 * 1024 * 1024, // 10MB max
+            self.allocator,
+            std.Io.Limit.limited(10 * 1024 * 1024), // 10MB max
         ) catch |err| {
             std.debug.print("Failed to read WASM file {s}: {}\n", .{ module.path, err });
             return error.ModuleNotFound;
@@ -345,14 +361,16 @@ pub const ModuleLoader = struct {
     }
 
     fn loadDynamic(self: *ModuleLoader, module: *Module) !void {
-        // Dynamic library loading using std.DynLib
-        var lib = std.DynLib.open(module.path) catch |err| {
+        _ = self;
+        // Dynamic library loading using std.DynLib. Hand the handle to the module
+        // immediately so it stays mapped for the module's lifetime and is closed
+        // exactly once in Module.deinit — the exports registered below borrow
+        // function pointers from this image.
+        module.dyn_lib = std.DynLib.open(module.path) catch |err| {
             std.debug.print("Failed to load dynamic library {s}: {}\n", .{ module.path, err });
             return error.ModuleNotFound;
         };
-
-        // Store the library handle for later cleanup
-        // In a full implementation, we'd track this in the Module struct
+        const lib = &module.dyn_lib.?;
 
         // Look for standard export function
         const init_fn = lib.lookup(*const fn () void, "nexus_module_init");
@@ -369,8 +387,6 @@ pub const ModuleLoader = struct {
         if (register_fn) |register| {
             register(&module.exports);
         }
-
-        _ = self;
     }
 };
 

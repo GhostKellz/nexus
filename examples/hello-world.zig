@@ -2,7 +2,7 @@ const std = @import("std");
 const nexus = @import("nexus");
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -69,18 +69,7 @@ fn handleRoot(req: *nexus.http.Request, res: *nexus.http.Response) !void {
         \\</head>
         \\<body>
         \\    <h1>⚡ Nexus Runtime</h1>
-        \\    <p><strong>Node.js reimagined in Zig + WASM</strong></p>
-        \\    <p>10x faster, 10x smaller, infinitely more powerful</p>
-        \\
-        \\    <div class="stats">
-        \\        <h3>Performance Stats</h3>
-        \\        <ul>
-        \\            <li>HTTP Requests/sec: <strong>500k+</strong> (vs Node.js: 50k)</li>
-        \\            <li>Cold Start: <strong>&lt;5ms</strong> (vs Node.js: 50ms)</li>
-        \\            <li>Memory Usage: <strong>~5MB</strong> (vs Node.js: 50MB)</li>
-        \\            <li>Binary Size: <strong>~5MB</strong> (vs Node.js: 50MB)</li>
-        \\        </ul>
-        \\    </div>
+        \\    <p><strong>An application runtime written in Zig.</strong></p>
         \\
         \\    <h2>API Endpoints</h2>
         \\    <ul>
@@ -92,18 +81,11 @@ fn handleRoot(req: *nexus.http.Request, res: *nexus.http.Response) !void {
         \\    <h2>Example Request</h2>
         \\    <pre>curl http://localhost:3000/api/hello</pre>
         \\
-        \\    <h2>Features</h2>
+        \\    <h2>What this example uses</h2>
         \\    <ul>
-        \\        <li>✅ Event loop with epoll/kqueue/IOCP</li>
-        \\        <li>✅ HTTP/1.1 server</li>
-        \\        <li>✅ WebSocket support</li>
-        \\        <li>✅ WASM runtime integration</li>
-        \\        <li>✅ WASI support</li>
-        \\        <li>✅ File system operations</li>
-        \\        <li>✅ TCP/UDP networking</li>
-        \\        <li>✅ Streams API</li>
-        \\        <li>✅ Module system</li>
-        \\        <li>✅ Security policies</li>
+        \\        <li>HTTP/1.1 server with routing</li>
+        \\        <li>JSON responses</li>
+        \\        <li>Request body handling</li>
         \\    </ul>
         \\
         \\    <p><a href="https://github.com/ghostkellz/nexus">GitHub</a> | <a href="/api/hello">API Demo</a></p>
@@ -119,15 +101,11 @@ fn handleHello(req: *nexus.http.Request, res: *nexus.http.Response) !void {
 
     try res.json(.{
         .message = "Hello from Nexus!",
-        .runtime = "Nexus v0.1.0",
+        .runtime = "Nexus v" ++ nexus.version,
         .language = "Zig",
-        .performance = "10x better than Node.js",
         .features = .{
-            "Native Performance",
-            "WASM Support",
             "Event Loop",
             "HTTP/WebSocket",
-            "Security Sandbox",
         },
     });
 }

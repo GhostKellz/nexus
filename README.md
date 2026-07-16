@@ -1,403 +1,212 @@
 <div align="center">
   <h1>⚡ Nexus</h1>
 
-  **Node.js reimagined in Zig + WASM**
-  *10x faster, 10x smaller, infinitely more powerful*
+  **A small, inspectable application runtime, written in Zig.**
 
-  [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-  [![Zig](https://img.shields.io/badge/Zig-0.16.0+-orange.svg)](https://ziglang.org)
-  [![Status](https://img.shields.io/badge/Status-Pre--Alpha-red.svg)](https://github.com/ghostkellz/nexus)
+  <p align="center">
+    <img src="https://img.shields.io/badge/Zig-F7A41D?style=for-the-badge&logo=zig&logoColor=white" alt="Zig">
+    <img src="https://img.shields.io/badge/WebAssembly-654FF0?style=for-the-badge&logo=webassembly&logoColor=white" alt="WebAssembly">
+    <img src="https://img.shields.io/badge/WASI-654FF0?style=for-the-badge&logo=webassembly&logoColor=white" alt="WASI">
+    <img src="https://img.shields.io/badge/Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black" alt="Linux">
+  </p>
+  <p align="center">
+    <img src="https://img.shields.io/badge/HTTP%2F2-1793D1?style=for-the-badge" alt="HTTP/2">
+    <img src="https://img.shields.io/badge/Capability_Security-7C3AED?style=for-the-badge" alt="Capability Security">
+    <img src="https://img.shields.io/badge/Zero_Dependencies-22C55E?style=for-the-badge" alt="Zero Dependencies">
+    <img src="https://img.shields.io/badge/License-MIT-blue?style=for-the-badge" alt="License: MIT">
+  </p>
 </div>
 
 ---
 
-## 🎯 What is Nexus?
+> [!WARNING]
+> **Nexus is experimental, pre-1.0 software under active development.**
+> The runtime compiles against a single pinned Zig dev toolchain, public APIs
+> are unstable, and several subsystems are scaffolding or partial
+> implementations. It is **not production-ready** — in particular the custom
+> TLS, ACME, WASM/WASI, gRPC, and QUIC/HTTP/3 paths are experimental and must
+> not be trusted with real traffic or secrets. See the
+> [capability status](#capability-status) matrix for what is actually usable.
 
-**Nexus** is a next-generation application runtime that combines:
-- 🔥 **Native Performance** — Compiled Zig, no JIT/GC overhead
-- 🌐 **WebAssembly-First** — Run WASM modules natively alongside Zig code
-- 🔒 **Secure by Default** — Capability-based security model
-- 🚀 **Developer Experience** — Ergonomic APIs inspired by Node.js
-- 🎯 **Polyglot Execution** — Run code from any language via WASM
+## Overview
 
-Think **Node.js**, but written in Zig, 10x faster, and with first-class WASM support.
+Nexus is an application runtime built around two ideas:
 
----
+- **A Zig core** — a native event loop, module system, and standard library
+  with no third-party dependencies and manual memory management. This is what
+  works today: run `.zig` sources and serve HTTP.
+- **WebAssembly as a planned execution target** — the engine, WASI, and
+  capability-policy types are exported so callers can build against a stable
+  surface, but there is no binary/`.wat` parser yet, so module instantiation
+  **fails closed** (`error.WasmParsingUnsupported`). Running real `.wasm`
+  modules end to end is not available in this release.
 
-## ⚡ Why Nexus?
+The goal is a small, inspectable runtime for HTTP services and, eventually,
+polyglot (WASM) workloads. This repository is the reference implementation and
+is still maturing — treat it as a foundation to build on and contribute to, not
+a finished product.
 
-| Feature | Node.js | Deno | Bun | **Nexus** |
-|---------|---------|------|-----|-----------|
-| Language | JavaScript | JavaScript | JavaScript | **Zig** |
-| Performance | JIT (~50k req/s) | JIT (~80k req/s) | JIT (~120k req/s) | **Native AOT (500k+ req/s)** |
-| Memory | GC (~50MB idle) | GC (~60MB idle) | GC (~40MB idle) | **Manual (~5MB idle)** |
-| Binary Size | ~50MB | ~100MB | ~50MB | **~5MB** |
-| Cold Start | ~50ms | ~30ms | ~10ms | **<5ms** |
-| WASM Support | Addon | First-class | Good | **Native first-class** |
-| Systems Access | Limited | Sandboxed | Full | **Full native** |
-| Package Manager | npm | Built-in | Built-in | **ZIM integration** |
+## Capability status
 
----
+Status reflects the current tree, not the long-term design goal.
 
-## 🚀 Quick Start
+### Exported public API — `@import("nexus")`
 
-### Installation
+These namespaces are what the library actually exposes (see
+[`src/root.zig`](src/root.zig)). Status is their maturity, not whether they
+compile.
+
+| Namespace | Status | Notes |
+|-----------|--------|-------|
+| `console` | 🟢 Working | Formatted logging helpers |
+| `runtime` | 🟡 Partial | epoll event loop with readiness dispatch + a work-stealing scheduler (Chase–Lev deque), both unit-tested — including concurrent steal races and clean worker shutdown. kqueue mirrors the model; IOCP is completion-based and fails closed. Linux is the only exercised backend |
+| `module` | 🟡 Partial | Zig/WASM resolution + content-addressed cache |
+| `http` (server) | 🟡 Partial | Basic request/response; framing & router being hardened |
+| `http.Client` | 🟡 Partial | Small-body requests |
+| `middleware` | 🟡 Partial | Real `next()` chain (ordering/short-circuit reliable); feature set still growing |
+| `static` | 🟡 Partial | Path confinement normalized component-wise (traversal rejected) |
+| `fs` | 🟡 Partial | Mid-migration to the pinned `std.Io` model |
+| `hot_reload` | 🟡 Partial | File watcher + reload manager backing `nexus dev` |
+| `net` (TCP / WebSocket) | 🟠 Experimental | WebSocket handshake/frame validation incomplete |
+| `stream` | 🟠 Experimental | Caller-owned callback context; concurrent pipes isolated |
+| `wasm` (engine / WASI / policy) | 🟠 Experimental | **No binary/`.wat` parser** — `instantiate` fails closed; interpreter runs a raw MVP-opcode subset only; the policy is not a sandbox for hostile code |
+
+The `nexus` **CLI** is 🟡 Partial: `run` (`.zig` only), `dev`, and `serve` are
+real; `build` wraps `zig build`; `deploy`/`test` and `.wasm`/`.wat` fail closed
+with a nonzero exit.
+
+### In-tree, not exported — no support promise
+
+These subsystems exist in the source and are unit-tested, but are deliberately
+**left out** of the public surface (`root.zig` asserts their absence). Importing
+them means reaching into internal files; treat them as planned, not shipped.
+
+| Subsystem | Status | Notes |
+|-----------|--------|-------|
+| `db` (PostgreSQL / Redis) | 🔴 Gated out | Removed from the public surface, the build, and the test tree; does not compile under the pinned toolchain (NX-011) |
+| `http2` | 🟠 Experimental | Framing/HPACK present; not interop-verified |
+| QUIC / HTTP/3 | 🟠 Experimental | Scaffolding only |
+| `grpc` | 🟠 Experimental | Not yet real HTTP/2 gRPC |
+| GraphQL | 🟠 Experimental | Scope not finalized |
+| OpenTelemetry | 🟠 Experimental | Console/log exporter only |
+| ZIM package client (`pkg`) | 🟠 Experimental | Install/search/remove fail closed (`error.PackageOperationUnavailable`) until a real pipeline lands |
+| TLS 1.2/1.3 | 🔴 Unsafe | Fails closed (no silent no-op), but peer verification is **not implemented** — `verify_peer` handshakes cannot complete |
+| ACME / Let's Encrypt | 🔴 Unsafe | Finalize/download fail closed; issuance does not complete against a real CA |
+
+**Removed this release:** the Wasmer-style compatibility layer and the
+ownership-broken `wasm.load` wrapper (their absence is asserted by tests).
+
+Legend: 🟢 working · 🟡 partial · 🟠 experimental · 🔴 experimental & unsafe.
+
+## Quick start
+
+Nexus builds against the **exact** pinned Zig dev toolchain declared in
+[`build.zig.zon`](build.zig.zon) (`minimum_zig_version`). Other Zig versions
+are not supported.
 
 ```bash
-# Clone the repository
 git clone https://github.com/ghostkellz/nexus.git
 cd nexus
-
-# Build from source
-zig build
-
-# Run Nexus
+zig build                      # build the CLI + library
 ./zig-out/bin/nexus --version
 ```
 
-### Hello World
+Run a source file. Dispatch is by extension, but only `.zig` executes today —
+`.wasm`/`.wat` fail closed with a nonzero exit because the engine has no
+binary/`.wat` parser yet:
 
-**`hello.zig`:**
+```bash
+./zig-out/bin/nexus run examples/hello-world.zig   # compiled & run via `zig run`
+./zig-out/bin/nexus dev 3000                        # watch src/ & examples/, hot reload on a port
+```
+
+A minimal HTTP handler:
+
 ```zig
+const std = @import("std");
 const nexus = @import("nexus");
 
 pub fn main() !void {
-    const server = try nexus.http.Server.init(.{
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var server = try nexus.http.Server.init(gpa.allocator(), .{
         .port = 3000,
+        .host = "0.0.0.0",
     });
     defer server.deinit();
 
-    try server.route("GET", "/", handleRequest);
-
-    nexus.console.log("Server running on http://localhost:3000");
+    try server.use(nexus.middleware.logger);
+    try server.route("GET", "/", handle);
     try server.listen();
 }
 
-fn handleRequest(req: *nexus.http.Request, res: *nexus.http.Response) !void {
-    try res.json(.{
-        .message = "Hello from Nexus!",
-        .performance = "10x better than Node.js",
-    });
+fn handle(req: *nexus.http.Request, res: *nexus.http.Response) !void {
+    _ = req;
+    try res.json(.{ .message = "Hello from Nexus" });
 }
 ```
 
-**Run it:**
-```bash
-nexus run hello.zig
+See [docs/getting-started/](docs/getting-started/) for installation,
+configuration, and a longer walkthrough.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    CLI["nexus CLI"] --> RT["Event loop<br/>(runtime)"]
+    RT --> MOD["Module system"]
+    MOD -->|.zig| NATIVE["Native Zig<br/>(runs via zig run)"]
+    MOD -.->|".wasm / .wat<br/>(fails closed: no parser)"| WASM["WASM engine<br/>+ WASI + policy"]
+    RT --> STD["Standard library"]
+    STD --> NET["net · http · static"]
+    STD --> DATA["db · stream · fs"]
+    STD --> OBS["console · telemetry"]
 ```
 
-**Benchmark it:**
-```bash
-# Nexus
-wrk -t12 -c400 -d30s http://localhost:3000
-# Expected: 500k+ req/sec
+Three pillars:
 
-# Node.js equivalent
-node hello.js
-wrk -t12 -c400 -d30s http://localhost:3000
-# Typical: 50k req/sec
-```
+- **Runtime** — event loop (epoll/kqueue/IOCP) + work-stealing scheduler.
+- **Module system** — resolves and caches `.zig` and `.wasm` modules; WASM runs
+  under a capability policy.
+- **Standard library** — `http`, `net`, `static`, `stream`, `fs`, `db`,
+  `console`, `middleware`, exported from [`src/root.zig`](src/root.zig).
+  (`http2`, `grpc`, `pkg`, and the other in-tree subsystems are not exported —
+  see [capability status](#capability-status).)
 
----
+Full design, data flows, and per-subsystem diagrams live in
+[docs/internals/architecture.md](docs/internals/architecture.md).
 
-## 🌟 Key Features
+## Documentation
 
-### 1. Native Performance
+All documentation lives under [`docs/`](docs/README.md):
 
-```zig
-// Nexus: Native compiled Zig
-const data = try nexus.fs.readFile("large.json"); // ~5000 MB/s
+- [Getting started](docs/getting-started/) — install, build, configure.
+- [Guides](docs/guides/) — HTTP, WebSocket, WASM modules, TLS/ACME, databases.
+- [Reference](docs/reference/) — CLI and public API.
+- [Internals](docs/internals/) — architecture, event loop, module & WASM design.
+- [Advisories](docs/advisories/) — accepted risks and resolved issues.
 
-// Node.js: V8 JIT
-const data = await fs.readFile("large.json"); // ~500 MB/s
-```
+## Contributing
 
-### 2. First-Class WASM Support
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for the
+workflow, formatting (`zig fmt`), and commit conventions. The current priorities
+mirror the [capability status](#capability-status): completing the Zig 0.17
+migration, memory/lifecycle safety, and closing the experimental security gaps.
 
-```zig
-const nexus = @import("nexus");
+## Security
 
-pub fn main() !void {
-    // Load WASM module from any language (Rust, Go, C++, etc.)
-    const image_processor = try nexus.wasm.load("./image-resize.wasm");
-    defer image_processor.deinit();
+Nexus is experimental and has known, documented security limitations (see the
+[capability status](#capability-status) and [docs/advisories/](docs/advisories/)).
+To report a vulnerability, follow [SECURITY.md](SECURITY.md) — please do not open
+public issues for security reports.
 
-    // Call WASM function with zero-copy where possible
-    const result = try image_processor.call("resize", .{
-        .width = 800,
-        .height = 600,
-        .quality = 85,
-    });
+## License
 
-    nexus.console.log("Processed image: {}", .{result});
-}
-```
-
-### 3. Polyglot Ecosystem
-
-```zig
-// Import Zig native code
-const zig_lib = @import("./native-lib.zig");
-
-// Import Rust compiled to WASM
-const rust_crypto = @import("./crypto.wasm");
-
-// Import Go compiled to WASM
-const go_parser = @import("./parser.wasm");
-
-pub fn main() !void {
-    const data = zig_lib.fetchData();
-    const encrypted = try rust_crypto.call("encrypt", .{data});
-    const parsed = try go_parser.call("parse", .{encrypted});
-    // Best of all languages in one runtime!
-}
-```
-
-### 4. Capability-Based Security
-
-```bash
-# Explicit permissions required
-nexus run app.zig --allow-read=/data --allow-net=api.example.com
-
-# WASM modules are sandboxed by default
-nexus run app.zig --allow-wasm=./untrusted.wasm
-```
-
-### 5. Edge & Serverless Ready
-
-```bash
-# Compile to WASM for Cloudflare Workers
-nexus build --target=wasm32-wasi
-
-# Deploy to any edge platform
-# - Cloudflare Workers
-# - Fastly Compute@Edge
-# - Deno Deploy
-# - AWS Lambda
-```
-
----
-
-## 📦 Package Management
-
-Nexus integrates seamlessly with **ZIM** (Zig Infrastructure Manager):
-
-```bash
-# Initialize project
-nexus init my-app
-cd my-app
-
-# Add dependencies
-nexus add http-server --git gh/nexus/http-server@v1.0.0
-nexus add db-driver --registry nexus.dev --version ^2.3.0
-
-# Add WASM dependency
-nexus add image-resize --wasm https://cdn.example.com/image-resize.wasm
-
-# Install dependencies
-nexus install
-
-# Run project
-nexus run src/main.zig
-```
-
-**`nexus.toml`:**
-```toml
-[project]
-name = "my-app"
-version = "1.0.0"
-runtime = "nexus@0.1.0"
-
-[dependencies]
-http-server = { git = "gh/nexus/http-server", tag = "v1.0.0" }
-db-driver = { registry = "nexus.dev", version = "^2.3.0" }
-
-[wasm-dependencies]
-image-resize = { url = "https://cdn.example.com/image-resize.wasm", hash = "sha256:..." }
-```
-
----
-
-## 🏗️ Architecture
-
-Nexus is built on three core pillars:
-
-### 1. Event Loop Runtime
-- Single-threaded async I/O
-- Built on epoll/kqueue/IOCP
-- <100μs latency (p99)
-- Optional worker threads
-
-### 2. Module System
-- **Native Zig modules** — `.zig` files compiled to native code
-- **WASM modules** — `.wasm` files executed in sandbox
-- **Dynamic libraries** — `.so`/`.dylib`/`.dll` via FFI
-- Content-addressed caching
-
-### 3. Standard Library
-- `nexus:runtime` — Event loop, process control
-- `nexus:fs` — File system operations
-- `nexus:net` — TCP/UDP/HTTP/WebSocket
-- `nexus:stream` — Readable/Writable streams
-- `nexus:crypto` — Hashing, encryption, RNG
-- `nexus:wasm` — WASM module loading
-- `nexus:console` — Formatted output
-
-See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed design.
-
----
-
-## 🎯 Use Cases
-
-### Web Servers
-```zig
-// High-performance HTTP/2 server
-const server = try nexus.http.Server.init(.{
-    .port = 443,
-    .tls = .{ .cert = "cert.pem", .key = "key.pem" },
-    .http2 = true,
-});
-```
-
-### API Gateways
-```zig
-// Load balance across WASM microservices
-const auth_service = try nexus.wasm.load("./auth.wasm");
-const payment_service = try nexus.wasm.load("./payment.wasm");
-```
-
-### Edge Functions
-```bash
-# Compile to WASM and deploy
-nexus build --target=wasm32-wasi
-wrangler deploy ./dist/worker.wasm
-```
-
-### CLI Tools
-```zig
-// Fast CLI tools with native performance
-pub fn main() !void {
-    const args = try nexus.process.args();
-    // ... blazingly fast CLI logic
-}
-```
-
-### Embedded Systems
-```bash
-# Cross-compile for ARM
-nexus build --target=aarch64-linux-gnu
-scp ./dist/app pi@raspberrypi:~/
-```
-
----
-
-## 📊 Benchmarks
-
-**HTTP Server (req/sec):**
-```
-Nexus:    ████████████████████ 500,000
-Bun:      ████████ 120,000
-Node.js:  ████ 50,000
-```
-
-**Cold Start (ms):**
-```
-Nexus:    ██ 5ms
-Bun:      ████ 10ms
-Deno:     ████████ 30ms
-Node.js:  ██████████ 50ms
-```
-
-**Memory Usage (MB):**
-```
-Nexus:    ██ 5MB
-Bun:      ████████ 40MB
-Node.js:  ██████████ 50MB
-Deno:     ████████████ 60MB
-```
-
----
-
-## 🗺️ Roadmap
-
-### v0.1.0 — Foundation (Current)
-- [x] Project scaffold
-- [ ] Event loop (epoll/kqueue/IOCP)
-- [ ] Module loader (Zig only)
-- [ ] Basic stdlib (fs, net, timer)
-- [ ] HTTP/1.1 server
-- [ ] CLI tool
-- [ ] ZIM integration
-
-### v0.2.0 — WASM Integration
-- [ ] WASM runtime (Wasmer/Wasmtime)
-- [ ] WASM module loading
-- [ ] WASI support
-- [ ] Host function bindings
-- [ ] Security policies
-
-### v0.3.0 — Production Ready
-- [ ] HTTP/2, HTTP/3
-- [ ] WebSocket
-- [ ] Streams API
-- [ ] Worker threads
-- [ ] Performance tuning
-- [ ] Production hardening
-
-### v1.0.0 — Ecosystem
-- [ ] Package registry
-- [ ] Web framework
-- [ ] Database drivers
-- [ ] Testing framework
-- [ ] VSCode extension
-- [ ] Full documentation
-
----
-
-## 🤝 Contributing
-
-We welcome contributions! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
-
-**Areas we need help:**
-- Event loop implementation
-- WASM runtime integration
-- Standard library modules
-- Documentation
-- Benchmarking
-- Package ecosystem
-
----
-
-## 📚 Documentation
-
-- [Specification](SPEC.md) — Technical specification
-- [Architecture](ARCHITECTURE.md) — System architecture
-- [API Reference](docs/API.md) — API documentation
-- [Examples](examples/) — Example projects
-
----
-
-## 🙏 Acknowledgments
-
-- **Zig Team** — For creating an amazing language
-- **Ghost Stack** — For the foundational libraries
-- **ZIM** — For package management infrastructure
-- **Node.js** — For API design inspiration
-- **Cloudflare Workers** — For edge runtime inspiration
-- **WASI** — For WebAssembly standards
-
----
-
-## 📜 License
-
-MIT License - see [LICENSE](LICENSE) for details.
+MIT — see [LICENSE](LICENSE). © CK Technology LLC.
 
 ---
 
 <div align="center">
-
-**Built with ⚡ by the Ghost Stack Team**
-
-[Website](https://nexus.dev) • [Documentation](https://docs.nexus.dev) • [Discord](https://discord.gg/nexus) • [Twitter](https://twitter.com/nexusruntime)
-
+  <sub>Built with Zig ⚡ — a small runtime you can read end to end.</sub>
 </div>

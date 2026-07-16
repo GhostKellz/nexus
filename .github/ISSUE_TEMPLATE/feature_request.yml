@@ -1,0 +1,52 @@
+name: Feature request
+description: Suggest a new capability or improvement to an existing Nexus subsystem.
+title: "[feature] "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check the [capability status](https://github.com/ghostkellz/nexus#capability-status)
+        first — several subsystems are already scaffolded but incomplete, so your
+        request may be about *finishing* one rather than adding something new.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem statement
+      description: What problem are you trying to solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the capability, API, or workflow you want.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - runtime / event loop
+        - CLI
+        - http / http2
+        - websocket / net
+        - wasm / wasi / policy
+        - db
+        - tls / acme
+        - tooling / docs
+        - other
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: How does this fit the WASM-first, zero-dependency, capability-secured design?
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds or existing APIs you already tried.

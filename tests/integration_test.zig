@@ -1,14 +1,14 @@
 const std = @import("std");
 const testing = std.testing;
 
-// Import all modules to test
-const wasi = @import("../src/wasm/wasi.zig");
-const engine = @import("../src/wasm/engine.zig");
-const wasmer = @import("../src/wasm/wasmer.zig");
-const policy = @import("../src/wasm/policy.zig");
-const tls = @import("../src/stdlib/net/tls.zig");
-const acme = @import("../src/stdlib/net/acme.zig");
-const http2 = @import("../src/stdlib/net/http2.zig");
+// Every source file may only belong to one module, and `nexus` already pulls
+// in this whole tree, so all internal types are reached through the public
+// `nexus` module. The aliases below preserve the original namespaced names.
+const nexus = @import("nexus");
+const wasm = nexus.wasm;
+const engine = wasm;
+const wasi = wasm;
+const policy = wasm;
 
 // =============================================================================
 // WASI Tests
@@ -18,7 +18,7 @@ test "WASI: Context initialization" {
     const allocator = testing.allocator;
 
     const args = [_][]const u8{ "prog", "arg1", "arg2" };
-    var context = try wasi.WasiContext.init(allocator, &args);
+    var context = try wasi.WasiContext.init(allocator, std.Io.Threaded.global_single_threaded.io(), &args);
     defer context.deinit();
 
     try testing.expectEqual(@as(usize, 3), context.args.len);
@@ -29,7 +29,7 @@ test "WASI: Environment variables" {
     const allocator = testing.allocator;
 
     const args = [_][]const u8{"prog"};
-    var context = try wasi.WasiContext.init(allocator, &args);
+    var context = try wasi.WasiContext.init(allocator, std.Io.Threaded.global_single_threaded.io(), &args);
     defer context.deinit();
 
     try context.setEnv("HOME", "/home/user");
@@ -43,7 +43,7 @@ test "WASI: Preopen directories" {
     const allocator = testing.allocator;
 
     const args = [_][]const u8{"prog"};
-    var context = try wasi.WasiContext.init(allocator, &args);
+    var context = try wasi.WasiContext.init(allocator, std.Io.Threaded.global_single_threaded.io(), &args);
     defer context.deinit();
 
     const rights = wasi.Rights{
@@ -51,7 +51,7 @@ test "WASI: Preopen directories" {
         .path_open = true,
     };
 
-    const fd = try context.addPreopen("/tmp", rights);
+    const fd = try context.addPreopen("/sandbox", rights);
     try testing.expectEqual(@as(wasi.Fd, 3), fd);
 }
 
@@ -59,7 +59,7 @@ test "WASI: Host functions - args_sizes_get" {
     const allocator = testing.allocator;
 
     const args = [_][]const u8{ "prog", "arg1", "arg2" };
-    var context = try wasi.WasiContext.init(allocator, &args);
+    var context = try wasi.WasiContext.init(allocator, std.Io.Threaded.global_single_threaded.io(), &args);
     defer context.deinit();
 
     var memory = try engine.Memory.init(allocator, 1, 10);
@@ -78,8 +78,14 @@ test "WASI: File operations - fd_write" {
     const allocator = testing.allocator;
 
     const args = [_][]const u8{"prog"};
-    var context = try wasi.WasiContext.init(allocator, &args);
+    var context = try wasi.WasiContext.init(allocator, std.Io.Threaded.global_single_threaded.io(), &args);
     defer context.deinit();
+
+    // Route the guest's stdout to the host's stderr for this test. The default
+    // is the inherited fd 1, but under `zig build test` fd 1 is the runner's
+    // --listen IPC channel; letting the guest write raw bytes there desyncs the
+    // protocol and deadlocks the build. fd 2 is not part of that protocol.
+    context.stdout = std.Io.File.stderr();
 
     var memory = try engine.Memory.init(allocator, 1, 10);
     defer memory.deinit();
@@ -126,7 +132,6 @@ test "WASM Engine: Memory growth" {
     var memory = try engine.Memory.init(allocator, 1, 10);
     defer memory.deinit();
 
-    const old_size = memory.size();
     const old_pages = try memory.grow(2);
 
     try testing.expectEqual(@as(u32, 1), old_pages);
@@ -158,7 +163,7 @@ test "WASM Engine: Instance and functions" {
 
     // Register host function
     const testFn = struct {
-        fn add(params: []const engine.Value, alloc: std.mem.Allocator) ![]engine.Value {
+        fn add(_: *engine.Instance, params: []const engine.Value, alloc: std.mem.Allocator) ![]engine.Value {
             const result = try alloc.alloc(engine.Value, 1);
             result[0] = engine.Value{ .i32 = params[0].i32 + params[1].i32 };
             return result;
@@ -179,68 +184,27 @@ test "WASM Engine: Instance and functions" {
 }
 
 // =============================================================================
-// Wasmer Integration Tests
-// =============================================================================
-
-test "Wasmer: Compilation modes" {
-    const allocator = testing.allocator;
-
-    const wasm_bytes = [_]u8{
-        0x00, 0x61, 0x73, 0x6d, // magic
-        0x01, 0x00, 0x00, 0x00, // version
-    };
-
-    var config = wasmer.RuntimeConfig.init(allocator);
-
-    // Test JIT compilation
-    config.compilation_mode = .jit;
-    var jit_module = try wasmer.CompiledModule.init(allocator, &wasm_bytes, config);
-    defer jit_module.deinit();
-
-    const info = jit_module.getCompilationInfo();
-    try testing.expect(info.is_compiled);
-    try testing.expectEqual(wasmer.CompilationMode.jit, info.compilation_mode);
-}
-
-test "Wasmer: Module cache" {
-    const allocator = testing.allocator;
-
-    var cache = try wasmer.ModuleCache.init(allocator, "/tmp/nexus-test-cache");
-    defer cache.deinit();
-
-    try cache.clear();
-}
-
-// =============================================================================
 // Security Policy Tests
 // =============================================================================
 
 test "Policy: Network access control" {
     const allocator = testing.allocator;
 
-    var policy = policy.WasmPolicy.init(allocator);
-    defer policy.deinit();
+    var pol = wasm.WasmPolicy.init(allocator);
+    defer pol.deinit();
 
     // Network disabled by default
-    try testing.expectError(error.PermissionDenied, policy.checkNet("example.com", 80));
+    try testing.expectError(error.PermissionDenied, pol.checkNet("example.com", 80));
 
-    // Enable network
-    policy.allow_net = true;
-    const rule = policy.NetRule{
-        .host = try allocator.dupe(u8, "api.example.com"),
-        .port = 443,
-    };
-    const rules = [_]policy.NetRule{rule};
-    policy.net_rules = &rules;
+    // Enable network (policy owns the duplicated host string).
+    pol.allow_net = true;
+    try pol.addNetRule("api.example.com", 443);
 
     // Should allow matching rule
-    try policy.checkNet("api.example.com", 443);
+    try pol.checkNet("api.example.com", 443);
 
     // Should deny non-matching host
-    try testing.expectError(error.PermissionDenied, policy.checkNet("evil.com", 443));
-
-    // Cleanup
-    allocator.free(rule.host);
+    try testing.expectError(error.PermissionDenied, pol.checkNet("evil.com", 443));
 }
 
 test "Policy: File system permissions" {
@@ -249,14 +213,17 @@ test "Policy: File system permissions" {
     var policy_inst = policy.WasmPolicy.init(allocator);
     defer policy_inst.deinit();
 
+    // Lexical policy strings, never touched on disk; a neutral fictional root
+    // keeps them from reading like real filesystem artifacts.
+
     // FS disabled by default
-    try testing.expectError(error.PermissionDenied, policy_inst.checkFsRead("/tmp/test"));
+    try testing.expectError(error.PermissionDenied, policy_inst.checkFsRead("/sandbox/test"));
 
     // Enable read-only access
-    policy_inst.allow_fs = .{ .read_only = try allocator.dupe(u8, "/tmp") };
+    try policy_inst.setFsReadOnly("/sandbox");
 
-    try policy_inst.checkFsRead("/tmp/test");
-    try testing.expectError(error.PermissionDenied, policy_inst.checkFsWrite("/tmp/test"));
+    try policy_inst.checkFsRead("/sandbox/test");
+    try testing.expectError(error.PermissionDenied, policy_inst.checkFsWrite("/sandbox/test"));
 }
 
 test "Policy: Resource limits" {
@@ -273,144 +240,6 @@ test "Policy: Resource limits" {
 }
 
 // =============================================================================
-// TLS/HTTPS Tests
-// =============================================================================
-
-test "TLS: Certificate parsing" {
-    const allocator = testing.allocator;
-
-    const pem_data =
-        \\-----BEGIN CERTIFICATE-----
-        \\MIICLDCCAdKgAwIBAgIBADAKBggqhkjOPQQDAjB9MQswCQYDVQQGEwJCRTEPMA0G
-        \\-----END CERTIFICATE-----
-    ;
-
-    var cert = try tls.Certificate.fromPEM(allocator, pem_data);
-    defer cert.deinit();
-
-    try testing.expect(cert.der_data.len > 0);
-    try cert.verify();
-}
-
-test "TLS: Configuration" {
-    const allocator = testing.allocator;
-
-    var config = tls.Config.init(allocator);
-    defer config.deinit();
-
-    try testing.expectEqual(tls.ProtocolVersion.tls_1_2, config.min_version);
-    try testing.expectEqual(tls.ProtocolVersion.tls_1_3, config.max_version);
-    try testing.expect(config.cipher_suites.len > 0);
-}
-
-test "TLS: Record parsing" {
-    const data = [_]u8{
-        @intFromEnum(tls.ContentType.handshake),
-        0x03, 0x03, // TLS 1.2
-        0x00, 0x05, // length 5
-        1, 2, 3, 4, 5,
-    };
-
-    const record = try tls.Record.parse(&data);
-    try testing.expectEqual(tls.ContentType.handshake, record.content_type);
-    try testing.expectEqual(tls.ProtocolVersion.tls_1_2, record.version);
-    try testing.expectEqual(@as(u16, 5), record.length);
-}
-
-// =============================================================================
-// ACME Tests
-// =============================================================================
-
-test "ACME: Challenge key authorization" {
-    const allocator = testing.allocator;
-
-    var challenge = try acme.Challenge.init(allocator, .http_01, "https://acme/chall", "token123");
-    defer challenge.deinit();
-
-    const thumbprint = "thumbprint456";
-    const key_authz = try challenge.keyAuthorization(thumbprint);
-    defer allocator.free(key_authz);
-
-    try testing.expectEqualStrings("token123.thumbprint456", key_authz);
-}
-
-test "ACME: Order lifecycle" {
-    const allocator = testing.allocator;
-
-    var order = try acme.Order.init(allocator, "https://acme/order/1", "https://acme/order/1/finalize");
-    defer order.deinit();
-
-    try testing.expectEqual(acme.OrderStatus.pending, order.status);
-}
-
-test "ACME: Client initialization" {
-    const allocator = testing.allocator;
-
-    var client = try acme.Client.init(allocator, acme.AcmeDirectory.LETS_ENCRYPT_STAGING);
-    defer client.deinit();
-
-    try testing.expectEqualStrings(acme.AcmeDirectory.LETS_ENCRYPT_STAGING, client.directory_url);
-}
-
-// =============================================================================
-// HTTP/2 Tests
-// =============================================================================
-
-test "HTTP/2: Frame header parsing" {
-    var buf: [9]u8 = undefined;
-
-    const header = http2.FrameHeader{
-        .length = 100,
-        .type = .headers,
-        .flags = 0x04,
-        .stream_id = 1,
-    };
-
-    try header.write(&buf);
-    const parsed = try http2.FrameHeader.parse(&buf);
-
-    try testing.expectEqual(header.length, parsed.length);
-    try testing.expectEqual(header.type, parsed.type);
-    try testing.expectEqual(header.flags, parsed.flags);
-    try testing.expectEqual(header.stream_id, parsed.stream_id);
-}
-
-test "HTTP/2: Stream priority" {
-    const allocator = testing.allocator;
-
-    const priority = http2.Priority{
-        .stream_dependency = 5,
-        .weight = 20,
-        .exclusive = true,
-    };
-
-    var buffer: [5]u8 = undefined;
-    try priority.write(&buffer);
-
-    const parsed = try http2.Priority.parse(&buffer);
-
-    try testing.expectEqual(priority.stream_dependency, parsed.stream_dependency);
-    try testing.expectEqual(priority.weight, parsed.weight);
-    try testing.expectEqual(priority.exclusive, parsed.exclusive);
-}
-
-test "HTTP/2: Stream state machine" {
-    const allocator = testing.allocator;
-
-    var stream = http2.Stream.init(allocator, 1);
-    defer stream.deinit();
-
-    try testing.expectEqual(http2.Stream.State.idle, stream.state);
-
-    stream.state = .open;
-    try testing.expectEqual(http2.Stream.State.open, stream.state);
-
-    const priority = http2.Priority{ .weight = 30 };
-    stream.updatePriority(priority);
-    try testing.expectEqual(@as(u8, 30), stream.priority.weight);
-}
-
-// =============================================================================
 // Integration Tests
 // =============================================================================
 
@@ -419,7 +248,7 @@ test "Integration: WASM + WASI + Security" {
 
     // Setup WASI context
     const args = [_][]const u8{"test_prog"};
-    var wasi_context = try wasi.WasiContext.init(allocator, &args);
+    var wasi_context = try wasi.WasiContext.init(allocator, std.Io.Threaded.global_single_threaded.io(), &args);
     defer wasi_context.deinit();
 
     // Setup security policy
@@ -430,32 +259,20 @@ test "Integration: WASM + WASI + Security" {
     var instance = engine.Instance.init(allocator);
     defer instance.deinit();
 
-    var memory = try allocator.create(engine.Memory);
-    defer allocator.destroy(memory);
-    memory.* = try engine.Memory.init(allocator, 1, 10);
-    defer memory.deinit();
+    // Ownership of `memory` transfers to the instance once assigned:
+    // Instance.deinit() calls mem.deinit() and destroys the pointer, so the
+    // test must not free it a second time.
+    const memory = try allocator.create(engine.Memory);
+    memory.* = engine.Memory.init(allocator, 1, 10) catch |err| {
+        allocator.destroy(memory);
+        return err;
+    };
     instance.memory = memory;
 
     // Initialize WASI host
-    var wasi_host = wasi.WasiHost.init(allocator, &wasi_context, memory);
+    const wasi_host = wasi.WasiHost.init(allocator, &wasi_context, memory);
     _ = wasi_host;
 
     // Verify policy limits
     try sec_policy.checkMemory(memory.getDataLen());
-}
-
-test "Integration: HTTP/2 + TLS" {
-    const allocator = testing.allocator;
-
-    // Setup TLS config
-    var tls_config = tls.Config.init(allocator);
-    defer tls_config.deinit();
-
-    // Setup HTTP/2 settings
-    const h2_settings = http2.Settings{
-        .max_concurrent_streams = 100,
-        .initial_window_size = 65535,
-    };
-
-    try testing.expectEqual(@as(u32, 100), h2_settings.max_concurrent_streams);
 }

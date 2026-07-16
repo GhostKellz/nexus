@@ -1,9 +1,15 @@
 const std = @import("std");
 const tcp = @import("tcp.zig");
+const build_options = @import("build_options");
 
 /// TLS 1.3 implementation for HTTPS support
 /// RFC 8446 - The Transport Layer Security (TLS) Protocol Version 1.3
-
+///
+/// SECURITY: this is an EXPERIMENTAL, UNVERIFIED transport. It does not
+/// implement peer/certificate verification, transcript verification, the key
+/// schedule, AEAD record protection, alerts, or downgrade resistance. It is
+/// gated off by default (`experimental_enabled`) and must never be treated as a
+/// secure channel. See advisory NX-001.
 pub const Error = error{
     HandshakeFailed,
     InvalidCertificate,
@@ -14,7 +20,31 @@ pub const Error = error{
     BadRecordMac,
     AlertReceived,
     ConnectionClosed,
+    /// The custom TLS transport was used without the `tls-experimental` build
+    /// option. It fails closed because it is not a secure implementation.
+    ExperimentalTlsDisabled,
+    /// Peer verification was requested but is not implemented; the handshake
+    /// refuses to present an unauthenticated peer as trusted.
+    PeerVerificationUnavailable,
 };
+
+/// Whether the experimental custom TLS transport is enabled for this build.
+/// False by default; set with `-Dtls-experimental=true`. When false, every
+/// handshake fails closed with `error.ExperimentalTlsDisabled`.
+pub const experimental_enabled = build_options.tls_experimental;
+
+/// Build-time gate: the bundled TLS stack is not secure, so it must not run
+/// unless the operator explicitly opted in. Extracted as a testable seam.
+fn ensureExperimentalEnabled() Error!void {
+    if (!experimental_enabled) return error.ExperimentalTlsDisabled;
+}
+
+/// Peer/certificate verification is not implemented. Requesting it (the
+/// default) must fail closed rather than silently accept any certificate.
+/// Extracted as a testable seam.
+fn ensurePeerVerified(config: *const Config) Error!void {
+    if (config.verify_peer) return error.PeerVerificationUnavailable;
+}
 
 /// TLS protocol versions
 pub const ProtocolVersion = enum(u16) {
@@ -100,6 +130,8 @@ pub const CipherSuite = enum(u16) {
 /// X.509 certificate parser following RFC 5280
 pub const Certificate = struct {
     der_data: []const u8,
+    /// X.509 version: 0 = v1, 1 = v2, 2 = v3
+    version: u8,
     subject: []const u8,
     issuer: []const u8,
     not_before: i64, // Unix timestamp
@@ -140,29 +172,36 @@ pub const Certificate = struct {
         _ = cert_len;
 
         // TBSCertificate ::= SEQUENCE
-        if (der_data[pos] != ASN1_SEQUENCE) return error.InvalidCertificate;
+        if (pos >= der_data.len or der_data[pos] != ASN1_SEQUENCE) return error.InvalidCertificate;
         pos += 1;
         const tbs_len = try parseLength(der_data, &pos);
-        const tbs_end = pos + tbs_len;
+        const tbs_end = std.math.add(usize, pos, tbs_len) catch return error.InvalidCertificate;
+        if (tbs_end > der_data.len) return error.InvalidCertificate;
 
         // version [0] EXPLICIT Version DEFAULT v1
         var version: u8 = 0;
         if (pos < der_data.len and der_data[pos] == ASN1_CONTEXT_0) {
             pos += 1;
             _ = try parseLength(der_data, &pos);
-            if (der_data[pos] != ASN1_INTEGER) return error.InvalidCertificate;
+            if (pos >= der_data.len or der_data[pos] != ASN1_INTEGER) return error.InvalidCertificate;
             pos += 1;
             const ver_len = try parseLength(der_data, &pos);
-            if (ver_len > 0) version = der_data[pos];
-            pos += ver_len;
+            if (ver_len > 0) {
+                if (pos >= der_data.len) return error.InvalidCertificate;
+                version = der_data[pos];
+            }
+            pos = std.math.add(usize, pos, ver_len) catch return error.InvalidCertificate;
+            if (pos > der_data.len) return error.InvalidCertificate;
         }
-        _ = version;
+        // Only v1, v2 and v3 (encoded 0..2) are defined by RFC 5280.
+        if (version > 2) return error.InvalidCertificate;
 
         // serialNumber INTEGER
-        if (der_data[pos] != ASN1_INTEGER) return error.InvalidCertificate;
+        if (pos >= der_data.len or der_data[pos] != ASN1_INTEGER) return error.InvalidCertificate;
         pos += 1;
         const serial_len = try parseLength(der_data, &pos);
-        pos += serial_len; // Skip serial number
+        pos = std.math.add(usize, pos, serial_len) catch return error.InvalidCertificate; // Skip serial number
+        if (pos > der_data.len) return error.InvalidCertificate;
 
         // signature AlgorithmIdentifier
         pos = try skipSequence(der_data, pos);
@@ -174,10 +213,11 @@ pub const Certificate = struct {
         errdefer allocator.free(issuer);
 
         // validity Validity
-        if (der_data[pos] != ASN1_SEQUENCE) return error.InvalidCertificate;
+        if (pos >= der_data.len or der_data[pos] != ASN1_SEQUENCE) return error.InvalidCertificate;
         pos += 1;
         const validity_len = try parseLength(der_data, &pos);
-        const validity_end = pos + validity_len;
+        const validity_end = std.math.add(usize, pos, validity_len) catch return error.InvalidCertificate;
+        if (validity_end > der_data.len) return error.InvalidCertificate;
 
         const not_before = try parseTime(der_data, &pos);
         const not_after = try parseTime(der_data, &pos);
@@ -200,6 +240,7 @@ pub const Certificate = struct {
 
         return Certificate{
             .der_data = try allocator.dupe(u8, der_data),
+            .version = version,
             .subject = subject,
             .issuer = issuer,
             .not_before = not_before,
@@ -236,7 +277,9 @@ pub const Certificate = struct {
         if (pos >= data.len or data[pos] != ASN1_SEQUENCE) return error.InvalidCertificate;
         pos += 1;
         const len = try parseLength(data, &pos);
-        return pos + len;
+        const end = std.math.add(usize, pos, len) catch return error.InvalidCertificate;
+        if (end > data.len) return error.InvalidCertificate;
+        return end;
     }
 
     fn extractName(allocator: std.mem.Allocator, name_data: []const u8) ![]const u8 {
@@ -410,7 +453,7 @@ pub const Certificate = struct {
         }
 
         const decoded_len = Base64.Decoder.calcSizeForSlice(clean) catch return error.InvalidCertificate;
-        var decoded = try allocator.alloc(u8, decoded_len);
+        const decoded = try allocator.alloc(u8, decoded_len);
         errdefer allocator.free(decoded);
 
         Base64.Decoder.decode(decoded, clean) catch return error.InvalidCertificate;
@@ -808,7 +851,7 @@ pub const TlsConnection = struct {
     /// Accumulated handshake messages hash for verify_data
     handshake_hash: std.crypto.hash.sha2.Sha256 = std.crypto.hash.sha2.Sha256.init(.{}),
     /// Master secret derived during key exchange
-    master_secret: [48]u8 = [_]u8{0} ** 48,
+    master_secret: [48]u8 = std.mem.zeroes([48]u8),
     /// Client random from ClientHello
     client_random: [32]u8 = undefined,
     /// Server random from ServerHello
@@ -862,6 +905,11 @@ pub const TlsConnection = struct {
 
     /// Perform TLS handshake
     pub fn handshake(self: *TlsConnection) !void {
+        // Fail closed unless the operator explicitly opted into the
+        // experimental, unauthenticated transport at build time. Otherwise this
+        // would present an unverified channel as a completed TLS session.
+        try ensureExperimentalEnabled();
+
         self.state = .handshaking;
 
         if (self.is_server) {
@@ -871,7 +919,7 @@ pub const TlsConnection = struct {
         }
 
         self.state = .established;
-        std.debug.print("✓ TLS handshake complete\n", .{});
+        std.debug.print("✓ experimental TLS handshake complete (UNVERIFIED)\n", .{});
     }
 
     fn clientHandshake(self: *TlsConnection) !void {
@@ -884,10 +932,12 @@ pub const TlsConnection = struct {
         // Receive Certificate
         try self.receiveCertificate();
 
-        // Verify certificate
-        if (self.config.verify_peer) {
-            // Certificate verification would happen here
-        }
+        // Peer/certificate verification is not implemented in the bundled TLS
+        // stack. Never report an unverified peer as trusted: when verification
+        // is requested (the default) fail closed instead of silently accepting
+        // any certificate. A caller who knowingly wants the experimental,
+        // unauthenticated transport must set `verify_peer = false` explicitly.
+        try ensurePeerVerified(self.config);
 
         // Send ClientKeyExchange, ChangeCipherSpec, Finished
         try self.sendClientFinished();
@@ -1068,7 +1118,6 @@ pub const TlsConnection = struct {
     /// Compute TLS 1.2 verify_data using PRF with SHA-256
     /// PRF(secret, label, seed) = P_SHA256(secret, label || seed)
     fn computeVerifyData(self: *TlsConnection, label: []const u8) [12]u8 {
-        const Sha256 = std.crypto.hash.sha2.Sha256;
         const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 
         // Get current hash of handshake messages
@@ -1191,7 +1240,9 @@ pub const TlsConnection = struct {
     }
 
     pub fn close(self: *TlsConnection) void {
-        // Send close_notify alert
+        // Best-effort close_notify alert. Per RFC 8446 the peer may have already
+        // closed the connection; if the alert write fails we still tear down the
+        // local state and close the TCP socket below, so the error is ignorable.
         const alert_data = [_]u8{ @intFromEnum(AlertLevel.warning), @intFromEnum(AlertDescription.close_notify) };
         self.sendRecord(.alert, &alert_data) catch {};
 
@@ -1253,17 +1304,91 @@ test "tls record parsing" {
     try std.testing.expectEqual(@as(u16, 5), record.length);
 }
 
+// A real self-signed P-256 certificate (CN=nexus.test), used to exercise the
+// happy path of the DER/X.509 parser.
+const test_cert_pem =
+    \\-----BEGIN CERTIFICATE-----
+    \\MIIBgDCCASWgAwIBAgIUbwORoWNaCHRlhQzC9d51YS4A6hwwCgYIKoZIzj0EAwIw
+    \\FTETMBEGA1UEAwwKbmV4dXMudGVzdDAeFw0yNjA3MTUwNDA3MjBaFw0zNjA3MTIw
+    \\NDA3MjBaMBUxEzARBgNVBAMMCm5leHVzLnRlc3QwWTATBgcqhkjOPQIBBggqhkjO
+    \\PQMBBwNCAASRI17ZlY6461x9O26R+ptSFjUFbuZxGk5zeGkJMLCgrEWo72qbglk2
+    \\4OvBgTrRtho2F49i4zM9WbAap/94wCljo1MwUTAdBgNVHQ4EFgQUwo3b35k/7FCD
+    \\WNTrrM/VD2I5eUkwHwYDVR0jBBgwFoAUwo3b35k/7FCDWNTrrM/VD2I5eUkwDwYD
+    \\VR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNJADBGAiEAyMudNY4aGTYDWWFahfCb
+    \\UHNcrzYKHCKOXZE9piE7AEECIQCApx/V/+L/2N8ofaDRAlG2/p6XnkKa6zHZPQ4J
+    \\LEVbRg==
+    \\-----END CERTIFICATE-----
+;
+
 test "tls certificate loading" {
     const allocator = std.testing.allocator;
 
-    const pem_data =
+    var cert = try Certificate.fromPEM(allocator, test_cert_pem);
+    defer cert.deinit();
+
+    try std.testing.expect(cert.der_data.len > 0);
+    // Version is v3 (encoded value 2) and the CN is extracted from the subject.
+    try std.testing.expectEqual(@as(u8, 2), cert.version);
+    try std.testing.expectEqualStrings("nexus.test", cert.subject);
+}
+
+test "tls certificate rejects truncated DER" {
+    const allocator = std.testing.allocator;
+
+    // A truncated certificate: valid PEM framing, but the DER body claims a
+    // length far larger than the bytes actually present. The parser must
+    // fail closed rather than reading out of bounds.
+    const truncated_pem =
         \\-----BEGIN CERTIFICATE-----
         \\MIICLDCCAdKgAwIBAgIBADAKBggqhkjOPQQDAjB9MQswCQYDVQQGEwJCRTEPMA0G
         \\-----END CERTIFICATE-----
     ;
 
-    var cert = try Certificate.fromPEM(allocator, pem_data);
-    defer cert.deinit();
+    try std.testing.expectError(error.InvalidCertificate, Certificate.fromPEM(allocator, truncated_pem));
+}
 
-    try std.testing.expect(cert.der_data.len > 0);
+test "tls certificate rejects malformed DER headers" {
+    const allocator = std.testing.allocator;
+
+    // Too short to hold even the outer SEQUENCE header.
+    try std.testing.expectError(error.InvalidCertificate, Certificate.init(allocator, &[_]u8{}));
+    try std.testing.expectError(error.InvalidCertificate, Certificate.init(allocator, &[_]u8{ 0x30, 0x01 }));
+
+    // Right length but the leading tag is not a SEQUENCE (0x30).
+    try std.testing.expectError(error.InvalidCertificate, Certificate.init(allocator, &[_]u8{ 0x02, 0x02, 0x00, 0x00 }));
+
+    // Long-form length claiming five length bytes: parseLength caps this at 4
+    // and must reject it rather than shifting an attacker-controlled width.
+    try std.testing.expectError(error.InvalidCertificate, Certificate.init(allocator, &[_]u8{ 0x30, 0x85, 0x01, 0x02, 0x03, 0x04, 0x05 }));
+
+    // Outer SEQUENCE declares 0x7f content bytes that are not present.
+    try std.testing.expectError(error.InvalidCertificate, Certificate.init(allocator, &[_]u8{ 0x30, 0x7f, 0x30, 0x02 }));
+}
+
+test "tls experimental transport is disabled by default (fail-closed)" {
+    // The bundled TLS stack performs no peer verification and no authenticated
+    // encryption, so it must be inaccessible unless explicitly enabled at build
+    // time. In the default build the handshake gate returns an error rather
+    // than presenting an unauthenticated channel as a completed TLS session.
+    if (!experimental_enabled) {
+        try std.testing.expectError(error.ExperimentalTlsDisabled, ensureExperimentalEnabled());
+    } else {
+        try ensureExperimentalEnabled();
+    }
+}
+
+test "tls peer verification fails closed (never silently accepts a certificate)" {
+    const allocator = std.testing.allocator;
+    var config = Config.init(allocator);
+    defer config.deinit();
+
+    // The default requests verification, which is unimplemented and therefore
+    // must fail closed instead of accepting any certificate (advisory NX-001).
+    try std.testing.expect(config.verify_peer);
+    try std.testing.expectError(error.PeerVerificationUnavailable, ensurePeerVerified(&config));
+
+    // Only an explicit opt-out (knowingly using the unauthenticated transport)
+    // is permitted to proceed.
+    config.verify_peer = false;
+    try ensurePeerVerified(&config);
 }

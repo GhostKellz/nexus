@@ -11,8 +11,8 @@ pub const OpenFlags = struct {
     append: bool = false,
     exclusive: bool = false,
 
-    pub fn toIoOpenFlags(self: OpenFlags) IoFile.OpenFlags {
-        return IoFile.OpenFlags{
+    pub fn toIoOpenFlags(self: OpenFlags) Dir.OpenFileOptions {
+        return Dir.OpenFileOptions{
             .mode = if (self.read and self.write)
                 .read_write
             else if (self.write)
@@ -22,8 +22,8 @@ pub const OpenFlags = struct {
         };
     }
 
-    pub fn toIoCreateFlags(self: OpenFlags) IoFile.CreateFlags {
-        return IoFile.CreateFlags{
+    pub fn toIoCreateFlags(self: OpenFlags) Dir.CreateFileOptions {
+        return Dir.CreateFileOptions{
             .read = self.read,
             .truncate = self.truncate,
             .exclusive = self.exclusive,
@@ -66,7 +66,7 @@ pub const File = struct {
 
     pub fn read(self: *File, buffer: []u8) !usize {
         var reader = self.file.reader(self.io, self.read_buffer);
-        return try reader.read(buffer);
+        return try reader.interface.readSliceShort(buffer);
     }
 
     pub fn readAll(self: *File) ![]u8 {
@@ -89,7 +89,7 @@ pub const File = struct {
 
     pub fn write(self: *File, data: []const u8) !usize {
         var writer = self.file.writer(self.io, self.write_buffer);
-        return try writer.write(data);
+        return try writer.interface.write(data);
     }
 
     pub fn writeAll(self: *File, data: []const u8) !void {
@@ -158,7 +158,7 @@ pub fn copyFile(allocator: std.mem.Allocator, io: Io, src: []const u8, dest: []c
 
 /// Move/rename file
 pub fn moveFile(io: Io, src: []const u8, dest: []const u8) !void {
-    try Dir.cwd().rename(io, src, dest);
+    try Dir.cwd().rename(src, Dir.cwd(), dest, io);
 }
 
 /// Get file stats
@@ -171,11 +171,14 @@ pub fn stat(io: Io, path: []const u8) !IoFile.Stat {
 test "file operations" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const test_file = "/tmp/nexus_test_file.txt";
-    const test_data = "Hello, Nexus!";
 
-    // Clean up any existing test file
-    deleteFile(io, test_file) catch {};
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_abs = tmp_buf[0..try tmp.dir.realPath(io, &tmp_buf)];
+    const test_file = try std.fs.path.join(allocator, &.{ tmp_abs, "nexus_test_file.txt" });
+    defer allocator.free(test_file);
+    const test_data = "Hello, Nexus!";
 
     // Test write
     try writeFile(allocator, io, test_file, test_data);

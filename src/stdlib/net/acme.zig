@@ -8,7 +8,6 @@ const HttpClient = std.http.Client;
 /// ACME (Automatic Certificate Management Environment) client
 /// RFC 8555 - Automatic Certificate Management Environment (ACME)
 /// Used for Let's Encrypt integration
-
 pub const Error = error{
     InvalidDirectory,
     AccountNotFound,
@@ -17,6 +16,12 @@ pub const Error = error{
     CertificateNotIssued,
     RateLimitExceeded,
     InvalidDomain,
+    /// An ACME operation whose network/protocol flow is still a placeholder
+    /// (finalize, certificate download, revocation, challenge provisioning, DNS
+    /// propagation/validation). These fail closed rather than fabricating
+    /// success, writing certificate files, or installing challenge state. Real
+    /// implementations land in Phase 6.
+    AcmeNotImplemented,
 };
 
 /// ACME directory URLs
@@ -408,7 +413,7 @@ pub const Client = struct {
 
     /// Initialize with IO for making HTTP requests
     pub fn initWithIo(allocator: std.mem.Allocator, io: std.Io, directory_url: []const u8) !Client {
-        var client = Client{
+        const client = Client{
             .directory_url = try allocator.dupe(u8, directory_url),
             .allocator = allocator,
             .io = io,
@@ -429,7 +434,7 @@ pub const Client = struct {
             self.allocator.free(loc);
         }
         if (self.http_client) |*hc| {
-            hc.connection_pool.deinit(self.allocator);
+            hc.deinit();
         }
     }
 
@@ -1112,28 +1117,28 @@ pub const Client = struct {
     }
 
     fn finalizeOrder(self: *Client, order: *const Order, csr: []const u8) !void {
+        _ = self;
         _ = order;
         _ = csr;
 
-        // Real implementation would POST CSR to finalize URL
-        // and wait for order status to become "valid"
-
-        std.debug.print("  ✓ Order finalized\n", .{});
+        // Finalization (POST CSR to the finalize URL, then poll until the order
+        // is "valid") is not implemented. Fail closed instead of printing
+        // success so no caller can proceed to download as though the order were
+        // valid. Real CSR POST + poll lands in Phase 6.
+        return error.AcmeNotImplemented;
     }
 
     fn downloadCertificate(self: *Client, order: *const Order) !tls.Certificate {
+        _ = self;
         _ = order;
 
-        // Real implementation would GET certificate from certificate_url
-        // Certificate chain is returned in PEM format
-
-        const cert_pem =
-            \\-----BEGIN CERTIFICATE-----
-            \\MIICLDCCAdKgAwIBAgIBADAKBggqhkjOPQQDAjB9MQswCQYDVQQGEwJCRTEPMA0G
-            \\-----END CERTIFICATE-----
-        ;
-
-        return try tls.Certificate.fromPEM(self.allocator, cert_pem);
+        // Certificate download (GET the issued chain from certificate_url) is
+        // not implemented. Previously this returned a hardcoded placeholder
+        // certificate, which would let callers install a fake cert as if it
+        // were a real, CA-issued one. Fail closed instead. This is the single
+        // issuance sink for requestCertificate, so failing here transitively
+        // fails all issuance. Real download lands in Phase 6.
+        return error.AcmeNotImplemented;
     }
 
     fn generatePrivateKey(self: *Client) ![]u8 {
@@ -1150,19 +1155,16 @@ pub const Client = struct {
 
     /// Serve HTTP-01 challenge response
     pub fn serveHTTP01Challenge(self: *Client, challenge: *const Challenge, response_path: []const u8) !void {
-        const account_thumbprint = try self.getAccountThumbprint();
-        defer self.allocator.free(account_thumbprint);
+        _ = self;
+        _ = challenge;
+        _ = response_path;
 
-        const key_authz = try challenge.keyAuthorization(account_thumbprint);
-        defer self.allocator.free(key_authz);
-
-        // Write challenge response to file for HTTP server
-        const file = try std.fs.cwd().createFile(response_path, .{});
-        defer file.close();
-
-        try file.writeAll(key_authz);
-
-        std.debug.print("  ✓ HTTP-01 challenge file created: {s}\n", .{response_path});
+        // Provisioning the HTTP-01 challenge response is not implemented. The
+        // previous version wrote the key authorization to an attacker-influenced
+        // path with default (world-readable) permissions and no atomicity. Fail
+        // closed instead of installing challenge state. A safe implementation
+        // (validated path, restrictive perms, atomic write) lands in Phase 6.
+        return error.AcmeNotImplemented;
     }
 
     fn getAccountThumbprint(self: *Client) ![]u8 {
@@ -1267,13 +1269,12 @@ pub const Client = struct {
         _ = record_name;
         _ = expected_value;
 
-        // Real implementation would:
-        // 1. Query multiple DNS servers
-        // 2. Wait until TXT record is visible
-        // 3. Implement exponential backoff
-
-        // Simulated wait
-        std.time.sleep(2 * std.time.ns_per_s);
+        // DNS propagation checking (query resolvers until the TXT record is
+        // visible, with backoff) is not implemented. The previous version just
+        // slept for a fixed interval and returned success, which would let a
+        // caller proceed before the record was actually visible. Fail closed.
+        // Real multi-resolver polling lands in Phase 6.
+        return error.AcmeNotImplemented;
     }
 
     /// Notify ACME server that challenge is ready
@@ -1281,8 +1282,10 @@ pub const Client = struct {
         _ = self;
         _ = challenge;
 
-        // Real implementation would POST empty JSON object to challenge URL
-        // with JWS signature
+        // Notifying the ACME server (JWS-signed POST to the challenge URL) is
+        // not implemented. Fail closed rather than silently returning success.
+        // Real implementation lands in Phase 6.
+        return error.AcmeNotImplemented;
     }
 
     /// Wait for ACME server to validate the challenge
@@ -1290,8 +1293,11 @@ pub const Client = struct {
         _ = self;
         _ = challenge;
 
-        // Real implementation would poll authorization URL until
-        // status becomes "valid" or "invalid"
+        // Polling the authorization URL until the challenge becomes "valid" or
+        // "invalid" is not implemented. Fail closed rather than reporting a
+        // challenge as validated when it was never checked. Real polling lands
+        // in Phase 6.
+        return error.AcmeNotImplemented;
     }
 
     /// Request wildcard certificate (requires DNS-01 challenge)
@@ -1356,10 +1362,15 @@ pub const Client = struct {
 
     /// Revoke certificate
     pub fn revokeCertificate(self: *Client, cert: *const tls.Certificate) !void {
+        _ = self;
         _ = cert;
 
-        // Real implementation would POST to revoke-cert endpoint
-        std.debug.print("✓ Certificate revoked\n", .{});
+        // Revocation (JWS-signed POST to the revoke-cert endpoint) is not
+        // implemented. The previous version printed "✓ Certificate revoked"
+        // without contacting the CA, so an operator could believe a compromised
+        // certificate was revoked when it was still live. Fail closed. Real
+        // revocation lands in Phase 6.
+        return error.AcmeNotImplemented;
     }
 };
 
@@ -1472,4 +1483,90 @@ test "acme order lifecycle" {
 
     try std.testing.expectEqual(OrderStatus.pending, order.status);
     try std.testing.expectEqualStrings("https://acme/order/1", order.url);
+}
+
+test "acme directory parser rejects malformed json" {
+    const allocator = std.testing.allocator;
+
+    // Not JSON at all.
+    try std.testing.expectError(error.InvalidDirectory, Client.parseDirectoryJson(allocator, "not json"));
+    // Empty body.
+    try std.testing.expectError(error.InvalidDirectory, Client.parseDirectoryJson(allocator, ""));
+    // Valid JSON object but missing the required newNonce/newAccount/... fields.
+    try std.testing.expectError(error.InvalidDirectory, Client.parseDirectoryJson(allocator, "{\"meta\":{}}"));
+    // Truncated JSON.
+    try std.testing.expectError(error.InvalidDirectory, Client.parseDirectoryJson(allocator, "{\"newNonce\":"));
+}
+
+test "acme order parser rejects malformed json" {
+    const allocator = std.testing.allocator;
+    const order_url = "https://acme/order/1";
+
+    try std.testing.expectError(error.InvalidResponse, Client.parseOrderJson(allocator, "not json", order_url));
+    try std.testing.expectError(error.InvalidResponse, Client.parseOrderJson(allocator, "", order_url));
+    // Object missing the required status/finalize fields.
+    try std.testing.expectError(error.InvalidResponse, Client.parseOrderJson(allocator, "{}", order_url));
+}
+
+test "acme certificate download fails closed (never fabricates a certificate)" {
+    const allocator = std.testing.allocator;
+
+    var client = try Client.init(allocator, AcmeDirectory.LETS_ENCRYPT_STAGING);
+    defer client.deinit();
+
+    var order = try Order.init(allocator, "https://acme/order/1", "https://acme/order/1/finalize");
+    defer order.deinit();
+
+    // Previously this returned a hardcoded placeholder certificate; it must now
+    // refuse rather than hand back a fake, un-issued cert.
+    try std.testing.expectError(error.AcmeNotImplemented, client.downloadCertificate(&order));
+}
+
+test "acme order finalization fails closed (never reports a bogus success)" {
+    const allocator = std.testing.allocator;
+
+    var client = try Client.init(allocator, AcmeDirectory.LETS_ENCRYPT_STAGING);
+    defer client.deinit();
+
+    var order = try Order.init(allocator, "https://acme/order/1", "https://acme/order/1/finalize");
+    defer order.deinit();
+
+    try std.testing.expectError(error.AcmeNotImplemented, client.finalizeOrder(&order, "csr-bytes"));
+}
+
+test "acme http-01 challenge provisioning fails closed (never writes a challenge file)" {
+    const allocator = std.testing.allocator;
+
+    var client = try Client.init(allocator, AcmeDirectory.LETS_ENCRYPT_STAGING);
+    defer client.deinit();
+
+    var challenge = try Challenge.init(allocator, .http_01, "https://acme/chall/1", "token");
+    defer challenge.deinit();
+
+    // Must not create the response file (previously written with default,
+    // world-readable permissions to a caller-supplied path). The function
+    // returns before reaching any filesystem write, so no file is installed.
+    try std.testing.expectError(error.AcmeNotImplemented, client.serveHTTP01Challenge(&challenge, "acme-challenge-should-not-exist"));
+}
+
+test "acme certificate revocation fails closed (never claims a phantom revoke)" {
+    const allocator = std.testing.allocator;
+
+    var client = try Client.init(allocator, AcmeDirectory.LETS_ENCRYPT_STAGING);
+    defer client.deinit();
+
+    // A minimal certificate value; revokeCertificate must reject before doing
+    // anything with it rather than printing a fake "revoked" success.
+    const cert = tls.Certificate{
+        .der_data = "",
+        .version = 2,
+        .subject = "",
+        .issuer = "",
+        .not_before = 0,
+        .not_after = 0,
+        .public_key = "",
+        .allocator = allocator,
+    };
+
+    try std.testing.expectError(error.AcmeNotImplemented, client.revokeCertificate(&cert));
 }

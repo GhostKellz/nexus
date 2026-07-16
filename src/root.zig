@@ -1,7 +1,15 @@
-// Nexus Runtime - Node.js reimagined in Zig + WASM
-// 10x faster, 10x smaller, infinitely more powerful
+// Nexus — a Zig runtime library. This file is the public API surface for
+// `@import("nexus")`. Pre-1.0, unstable, and Linux-only. Experimental or
+// unfinished subsystems (HTTP/2, HTTP/3, QUIC, gRPC, GraphQL, ACME, the custom
+// TLS transport, the ZIM package client, and the Wasmer-style layer) are
+// intentionally NOT exported here; they remain in-tree and unit-tested but are
+// not part of the supported surface. See docs/README.md#capability-status.
 
 const std = @import("std");
+
+/// Release version, sourced from `build.zig.zon` through `build_options` so the
+/// library, CLI, and package metadata always report the same string.
+pub const version = @import("build_options").version;
 
 // Runtime core
 pub const runtime = struct {
@@ -9,8 +17,6 @@ pub const runtime = struct {
     pub const Timer = @import("runtime/event_loop.zig").Timer;
     pub const Task = @import("runtime/event_loop.zig").Task;
     pub const IoEvent = @import("runtime/event_loop.zig").IoEvent;
-    pub const getEventLoop = @import("runtime/event_loop.zig").getEventLoop;
-    pub const setEventLoop = @import("runtime/event_loop.zig").setEventLoop;
 };
 
 // Hot reload for development
@@ -43,6 +49,7 @@ pub const wasm = struct {
     pub const WasiHost = @import("wasm/wasi.zig").WasiHost;
     pub const Errno = @import("wasm/wasi.zig").Errno;
     pub const Rights = @import("wasm/wasi.zig").Rights;
+    pub const Fd = @import("wasm/wasi.zig").Fd;
 
     // Policy
     pub const WasmPolicy = @import("wasm/policy.zig").WasmPolicy;
@@ -50,11 +57,11 @@ pub const wasm = struct {
     pub const NetRule = @import("wasm/policy.zig").NetRule;
     pub const PolicyConfig = @import("wasm/policy.zig").PolicyConfig;
 
-    /// Load and instantiate a WASM module
-    pub fn load(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !*Module {
-        var engine = Engine.init(allocator);
-        return try engine.loadModule(io, path);
-    }
+    // Note: there is no `load()` convenience wrapper. A `Module` is owned by the
+    // `Engine` that created it, so construct an `Engine`, call
+    // `engine.loadModule(io, path)`, and `engine.deinit()` when done. (The
+    // parser is unimplemented, so `loadModule` fails closed today — see
+    // docs/internals/wasm-runtime.md.)
 };
 
 // File system
@@ -100,16 +107,6 @@ pub const http = struct {
     pub const Client = @import("stdlib/net/http_client.zig").Client;
 };
 
-// HTTP/2
-pub const http2 = struct {
-    pub const Server = @import("stdlib/net/http2.zig").Server;
-    pub const Connection = @import("stdlib/net/http2.zig").Connection;
-    pub const FrameType = @import("stdlib/net/http2.zig").FrameType;
-    pub const FrameHeader = @import("stdlib/net/http2.zig").FrameHeader;
-    pub const Stream = @import("stdlib/net/http2.zig").Stream;
-    pub const Settings = @import("stdlib/net/http2.zig").Settings;
-};
-
 // Static files
 pub const static = struct {
     pub const serveFile = @import("stdlib/net/static.zig").serveFile;
@@ -139,15 +136,6 @@ pub const console = struct {
     pub const clear = @import("stdlib/console/console.zig").clear;
 };
 
-// gRPC
-pub const grpc = struct {
-    pub const Server = @import("stdlib/net/grpc.zig").Server;
-    pub const Method = @import("stdlib/net/grpc.zig").Method;
-    pub const MethodHandler = @import("stdlib/net/grpc.zig").MethodHandler;
-    pub const ServiceConfig = @import("stdlib/net/grpc.zig").ServiceConfig;
-    pub const Protobuf = @import("stdlib/net/grpc.zig").Protobuf;
-};
-
 // Middleware
 pub const middleware = struct {
     pub const logger = @import("stdlib/net/middleware.zig").logger;
@@ -157,27 +145,11 @@ pub const middleware = struct {
     pub const auth = @import("stdlib/net/middleware.zig").auth;
 };
 
-// Package management
-pub const pkg = struct {
-    pub const ZimClient = @import("stdlib/package/zim.zig").ZimClient;
-    pub const PackageInfo = @import("stdlib/package/zim.zig").PackageInfo;
-    pub const Manifest = @import("stdlib/package/zim.zig").Manifest;
-};
-
-// Database drivers
-pub const db = struct {
-    // PostgreSQL
-    pub const PostgresConnection = @import("stdlib/db/postgres.zig").Connection;
-    pub const PostgresPool = @import("stdlib/db/postgres.zig").Pool;
-    pub const PostgresConfig = @import("stdlib/db/postgres.zig").ConnectionConfig;
-    pub const PostgresQueryResult = @import("stdlib/db/postgres.zig").QueryResult;
-    pub const PostgresRow = @import("stdlib/db/postgres.zig").Row;
-
-    // Redis
-    pub const RedisClient = @import("stdlib/db/redis.zig").Client;
-    pub const RedisConfig = @import("stdlib/db/redis.zig").ConnectionConfig;
-    pub const RedisValue = @import("stdlib/db/redis.zig").Value;
-};
+// Database drivers (PostgreSQL, Redis) are intentionally NOT exported. They are
+// experimental scaffolding with multiple removed-std-API calls under the pinned
+// toolchain, so they are gated out of the public surface, the build, and the
+// test tree until the ≥v0.2 migration lands. See NX-011 in
+// docs/advisories/accepted.md and the absence test below.
 
 // Convenience re-exports for cleaner API
 pub const EventLoop = runtime.EventLoop;
@@ -185,6 +157,106 @@ pub const Server = http.Server;
 pub const File = fs.File;
 pub const WebSocket = net.WebSocket;
 
-test "nexus runtime" {
-    std.testing.refAllDecls(@This());
+// Recursively reference every declaration reachable from a container so that
+// the *bodies* of public methods are semantically analyzed, not just the type
+// aliases. `std.testing.refAllDecls` is shallow — it references each top-level
+// decl but never descends into a namespace/struct's own methods — so a
+// removed-std-API regression in an otherwise-unreached public method (e.g.
+// `ModuleLoader.loadWasm`, `WebSocketServer.accept`, `WasiHost.clockTimeGet`)
+// slips through a green build. Descending forces the whole public surface to
+// compile. (Zig memoizes comptime calls per type, so self-referential types
+// terminate.)
+fn refAllDeclsRecursive(comptime T: type) void {
+    if (!@import("builtin").is_test) return;
+    inline for (comptime std.meta.declarations(T)) |decl_name| {
+        const decl = @field(T, decl_name);
+        if (@TypeOf(decl) == type) {
+            switch (@typeInfo(decl)) {
+                .@"struct", .@"enum", .@"union", .@"opaque" => refAllDeclsRecursive(decl),
+                else => {},
+            }
+        }
+        _ = &@field(T, decl_name);
+    }
+}
+
+test "nexus runtime - public surface compiles" {
+    refAllDeclsRecursive(@This());
+}
+
+// Contract test: the experimental/unfinished subsystems listed in the file
+// header must stay OUT of the default public surface. They remain in-tree and
+// unit-tested (see the `test {}` aggregate below), but exporting them would be
+// a support promise this release does not make. Assert their absence directly
+// so a future accidental re-export fails the test suite instead of shipping.
+test "experimental subsystems are not part of the default public surface" {
+    const S = @This();
+    inline for (.{
+        "http2", "http3", "quic",    "tls",
+        "acme",  "grpc",  "graphql", "pkg",
+        "otel",  "db",
+    }) |name| {
+        try std.testing.expect(!@hasDecl(S, name));
+    }
+    // The Wasmer-style layer and the ownership-broken `load` wrapper are gone
+    // from the `wasm` namespace; only the Engine/WASI/policy surface remains.
+    try std.testing.expect(!@hasDecl(wasm, "wasmer"));
+    try std.testing.expect(!@hasDecl(wasm, "load"));
+}
+
+// Aggregate every internal source file so `zig build test` compiles and runs
+// the complete unit-test tree. `refAllDecls` above only references the aliased
+// types re-exported here, which does not pull in the `test` blocks that live in
+// the underlying files. Importing each file as a container does. Files that
+// depend on the public `nexus` module (e.g. src/main.zig) are excluded because
+// this module cannot import itself; they are covered by their own test
+// executables.
+test {
+    // Runtime core
+    _ = @import("runtime/event_loop.zig");
+    _ = @import("runtime/scheduler.zig");
+    _ = @import("runtime/hot_reload.zig");
+
+    // Module system
+    _ = @import("module/loader.zig");
+
+    // WASM subsystem
+    _ = @import("wasm/engine.zig");
+    _ = @import("wasm/interpreter.zig");
+    _ = @import("wasm/wasi.zig");
+    _ = @import("wasm/wasmer.zig");
+    _ = @import("wasm/policy.zig");
+
+    // File system
+    _ = @import("stdlib/fs/file.zig");
+
+    // Networking + protocols
+    _ = @import("stdlib/net/tcp.zig");
+    _ = @import("stdlib/net/websocket.zig");
+    _ = @import("stdlib/net/http.zig");
+    _ = @import("stdlib/net/http_client.zig");
+    _ = @import("stdlib/net/http_parser.zig");
+    _ = @import("stdlib/net/http2.zig");
+    _ = @import("stdlib/net/http3.zig");
+    _ = @import("stdlib/net/hpack.zig");
+    _ = @import("stdlib/net/huffman.zig");
+    _ = @import("stdlib/net/quic.zig");
+    _ = @import("stdlib/net/tls.zig");
+    _ = @import("stdlib/net/acme.zig");
+    _ = @import("stdlib/net/static.zig");
+    _ = @import("stdlib/net/middleware.zig");
+    _ = @import("stdlib/net/grpc.zig");
+    _ = @import("stdlib/net/graphql.zig");
+
+    // Streams, console, telemetry
+    _ = @import("stdlib/stream/stream.zig");
+    _ = @import("stdlib/console/console.zig");
+    _ = @import("stdlib/telemetry/otel.zig");
+
+    // Package management
+    _ = @import("stdlib/package/zim.zig");
+
+    // Database drivers (postgres.zig, redis.zig) are deliberately excluded: they
+    // do not compile against the pinned toolchain and are gated out of the
+    // release (NX-011). Re-add them here once the ≥v0.2 migration restores them.
 }

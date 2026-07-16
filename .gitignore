@@ -2,8 +2,10 @@
 zig-out/
 archive/
 tasks/
+zig-pkg/
 *.o
 *.exe
 CLAUDE.md
-TODO.md
-DEVELOPMENT_ROADMAP.md
+
+# Stray compiled test binaries
+test_std

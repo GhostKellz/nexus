@@ -1,5 +1,6 @@
 const std = @import("std");
 const engine = @import("engine.zig");
+const policy_mod = @import("policy.zig");
 
 /// WASM opcodes (subset - core instructions)
 pub const Opcode = enum(u8) {
@@ -123,6 +124,9 @@ pub const Stack = struct {
     }
 
     pub fn push(self: *Stack, value: engine.Value) !void {
+        // Cap operand-stack depth: untrusted code that pushes in a loop must
+        // fail closed with StackOverflow rather than exhausting memory.
+        if (self.values.items.len >= limits.max_value_stack) return error.StackOverflow;
         try self.values.append(self.allocator, value);
     }
 
@@ -188,6 +192,26 @@ pub const ControlFrame = struct {
     else_pc: ?usize, // Location of else branch (for if)
 };
 
+/// Execution resource ceilings applied while running untrusted WASM. Every
+/// bound is driven by attacker-controlled bytecode (operand stack pushes,
+/// nested blocks, `br_table` targets, global indices, and loop iterations), so
+/// each must be finite and fail closed rather than growing without limit or
+/// spinning forever. The values are generous for legitimate modules but cap
+/// the blast radius of a hostile one.
+pub const limits = struct {
+    /// Maximum operand stack depth (slots).
+    pub const max_value_stack: usize = 64 * 1024;
+    /// Maximum nesting of block/loop/if control frames.
+    pub const max_control_depth: usize = 4 * 1024;
+    /// Maximum `br_table` target entries decoded from one instruction.
+    pub const max_br_table_targets: u32 = 64 * 1024;
+    /// Maximum interpreter global slots addressable by `global_set`.
+    pub const max_globals: u32 = 64 * 1024;
+    /// Instruction budget ("fuel") consumed per `execute` call; a module that
+    /// exceeds it (e.g. an unbounded `loop`/`br`) is aborted.
+    pub const max_instructions: u64 = 100_000_000;
+};
+
 /// WASM bytecode interpreter
 pub const Interpreter = struct {
     stack: Stack,
@@ -196,6 +220,14 @@ pub const Interpreter = struct {
     instance: *engine.Instance,
     allocator: std.mem.Allocator,
     globals: std.ArrayListUnmanaged(engine.Value),
+    /// Instruction budget for a single `execute` call. Defaults to
+    /// `limits.max_instructions`; an embedder may lower it to tighten the
+    /// ceiling for particularly untrusted modules.
+    fuel_limit: u64 = limits.max_instructions,
+    /// Control-frame nesting ceiling for this run. Defaults to the hardcoded
+    /// `limits.max_control_depth` blast-radius cap; `bindPolicy` may only lower
+    /// it so a restrictive policy's stack-depth budget is actually enforced.
+    control_depth_limit: usize = limits.max_control_depth,
 
     pub fn init(allocator: std.mem.Allocator, instance: *engine.Instance, local_count: usize) !Interpreter {
         return Interpreter{
@@ -215,7 +247,40 @@ pub const Interpreter = struct {
         self.globals.deinit(self.allocator);
     }
 
+    /// Bind an execution policy so its limits are enforced structurally by this
+    /// interpreter rather than living as standalone `check*` methods a caller
+    /// could forget to invoke. Each budget is *tightened* (never loosened): the
+    /// control-depth ceiling and instruction fuel drop to the policy's values
+    /// when stricter, and the instance's linear-memory page cap is clamped to
+    /// the policy's byte budget so `memory.grow` fails closed past it.
+    pub fn bindPolicy(self: *Interpreter, p: *const policy_mod.WasmPolicy) void {
+        self.control_depth_limit = @min(self.control_depth_limit, p.max_stack_depth);
+        self.fuel_limit = @min(self.fuel_limit, p.max_instructions);
+
+        const policy_pages = p.maxWasmPages();
+        if (self.instance.getMemory()) |mem| {
+            mem.max_pages = if (mem.max_pages) |declared|
+                @min(declared, policy_pages)
+            else
+                policy_pages;
+        }
+    }
+
+    /// Append a control frame, rejecting excessive nesting. Untrusted bytecode
+    /// can nest blocks/loops/ifs arbitrarily; without a ceiling the control
+    /// stack grows until allocation fails. The ceiling is the policy-tightened
+    /// `control_depth_limit` (defaults to `limits.max_control_depth`).
+    fn pushControl(self: *Interpreter, frame: ControlFrame) !void {
+        if (self.control_stack.items.len >= self.control_depth_limit) {
+            return error.CallStackExhausted;
+        }
+        try self.control_stack.append(self.allocator, frame);
+    }
+
     pub fn setGlobal(self: *Interpreter, index: u32, value: engine.Value) !void {
+        // A hostile `global_set` index would otherwise drive an unbounded
+        // append loop (up to 4 billion zero entries) — reject it up front.
+        if (index >= limits.max_globals) return error.InvalidGlobalIndex;
         while (self.globals.items.len <= index) {
             try self.globals.append(self.allocator, engine.Value{ .i32 = 0 });
         }
@@ -269,8 +334,15 @@ pub const Interpreter = struct {
     /// Execute WASM bytecode
     pub fn execute(self: *Interpreter, code: []const u8) ![]engine.Value {
         var pc: usize = 0; // Program counter
+        var fuel: u64 = self.fuel_limit;
 
         while (pc < code.len) {
+            // Instruction budget: an unbounded loop (e.g. `loop … br 0 … end`)
+            // would otherwise spin forever. Charge one unit per instruction and
+            // abort when exhausted.
+            if (fuel == 0) return error.InstructionBudgetExceeded;
+            fuel -= 1;
+
             const opcode = @as(Opcode, @enumFromInt(code[pc]));
             pc += 1;
 
@@ -283,7 +355,7 @@ pub const Interpreter = struct {
                 .block => {
                     _ = try readLEB128(i32, code, &pc); // block type
                     const end_pc = try findBlockEnd(code, pc);
-                    try self.control_stack.append(self.allocator, ControlFrame{
+                    try self.pushControl(ControlFrame{
                         .opcode = .block,
                         .start_pc = pc,
                         .end_pc = end_pc,
@@ -295,7 +367,7 @@ pub const Interpreter = struct {
                     _ = try readLEB128(i32, code, &pc); // block type
                     const start_pc = pc;
                     const end_pc = try findBlockEnd(code, pc);
-                    try self.control_stack.append(self.allocator, ControlFrame{
+                    try self.pushControl(ControlFrame{
                         .opcode = .loop,
                         .start_pc = start_pc,
                         .end_pc = end_pc,
@@ -310,7 +382,7 @@ pub const Interpreter = struct {
 
                     if (condition.i32 != 0) {
                         // Execute if branch
-                        try self.control_stack.append(self.allocator, ControlFrame{
+                        try self.pushControl(ControlFrame{
                             .opcode = .if_,
                             .start_pc = pc,
                             .end_pc = end_pc,
@@ -327,7 +399,7 @@ pub const Interpreter = struct {
                                 _ = try readLEB128(i32, code, &pc);
                                 depth += 1;
                             } else if (op == 0x05 and depth == 1) { // else at our level
-                                try self.control_stack.append(self.allocator, ControlFrame{
+                                try self.pushControl(ControlFrame{
                                     .opcode = .if_,
                                     .start_pc = pc,
                                     .end_pc = end_pc,
@@ -389,6 +461,9 @@ pub const Interpreter = struct {
                 },
                 .br_table => {
                     const count = try readLEB128(u32, code, &pc);
+                    // `count` is attacker-controlled; without a ceiling the
+                    // following loop allocates up to ~4 billion entries.
+                    if (count > limits.max_br_table_targets) return error.TooManyBranchTargets;
                     var targets: std.ArrayList(u32) = .empty;
                     defer targets.deinit(self.allocator);
                     var i: u32 = 0;
@@ -415,16 +490,28 @@ pub const Interpreter = struct {
                 },
                 .return_ => break,
                 .call => {
-                    const func_idx = try readLEB128(u32, code, &pc);
-                    // Function calls would require full function table support
-                    // For now, log the call
-                    std.debug.print("WASM call to function {d}\n", .{func_idx});
+                    // This interpreter has no call-frame machinery: it executes a
+                    // single function body with one locals frame and no function
+                    // index space to dispatch into. The previous behaviour decoded
+                    // the callee index, printed it, and fell through — silently
+                    // leaving the operand stack in the pre-call shape (no arguments
+                    // consumed, no results pushed) so every instruction afterward
+                    // ran against corrupt data. Fail closed instead: a module that
+                    // performs a call is rejected, never mis-executed. Real direct
+                    // calls (type-checked frames, locals, results, traps) are a
+                    // separate, unshipped feature.
+                    _ = try readLEB128(u32, code, &pc);
+                    return error.UnsupportedCall;
                 },
                 .call_indirect => {
-                    const type_idx = try readLEB128(u32, code, &pc);
-                    const table_idx = try readLEB128(u32, code, &pc);
-                    const func_idx = try self.stack.pop();
-                    std.debug.print("WASM call_indirect type={d} table={d} func={d}\n", .{ type_idx, table_idx, func_idx.i32 });
+                    // Same rationale as `.call`: without a function table bound to
+                    // executable bodies and a frame stack, an indirect call cannot
+                    // be performed. Decode the immediates so the refusal is
+                    // unambiguous about which opcode it saw, then fail closed
+                    // rather than pop the index and drift on.
+                    _ = try readLEB128(u32, code, &pc); // type index
+                    _ = try readLEB128(u32, code, &pc); // table index
+                    return error.UnsupportedIndirectCall;
                 },
 
                 // Global variables
@@ -682,7 +769,7 @@ pub const Interpreter = struct {
                     _ = try readLEB128(u32, code, &pc); // alignment
                     const offset = try readLEB128(u32, code, &pc);
                     const addr = try self.stack.pop();
-                    const value = try memory.readInt(i32, @intCast(addr.i32 + @as(i32, @intCast(offset))));
+                    const value = try memory.readInt(i32, try effAddr(addr.i32, offset));
                     try self.stack.push(engine.Value{ .i32 = value });
                 },
                 .i64_load => {
@@ -690,7 +777,7 @@ pub const Interpreter = struct {
                     _ = try readLEB128(u32, code, &pc); // alignment
                     const offset = try readLEB128(u32, code, &pc);
                     const addr = try self.stack.pop();
-                    const value = try memory.readInt(i64, @intCast(addr.i32 + @as(i32, @intCast(offset))));
+                    const value = try memory.readInt(i64, try effAddr(addr.i32, offset));
                     try self.stack.push(engine.Value{ .i64 = value });
                 },
                 .f32_load => {
@@ -698,7 +785,7 @@ pub const Interpreter = struct {
                     _ = try readLEB128(u32, code, &pc); // alignment
                     const offset = try readLEB128(u32, code, &pc);
                     const addr = try self.stack.pop();
-                    const bits = try memory.readInt(u32, @intCast(addr.i32 + @as(i32, @intCast(offset))));
+                    const bits = try memory.readInt(u32, try effAddr(addr.i32, offset));
                     try self.stack.push(engine.Value{ .f32 = @bitCast(bits) });
                 },
                 .f64_load => {
@@ -706,7 +793,7 @@ pub const Interpreter = struct {
                     _ = try readLEB128(u32, code, &pc); // alignment
                     const offset = try readLEB128(u32, code, &pc);
                     const addr = try self.stack.pop();
-                    const bits = try memory.readInt(u64, @intCast(addr.i32 + @as(i32, @intCast(offset))));
+                    const bits = try memory.readInt(u64, try effAddr(addr.i32, offset));
                     try self.stack.push(engine.Value{ .f64 = @bitCast(bits) });
                 },
                 .i32_load8_s => {
@@ -714,7 +801,7 @@ pub const Interpreter = struct {
                     _ = try readLEB128(u32, code, &pc); // alignment
                     const offset = try readLEB128(u32, code, &pc);
                     const addr = try self.stack.pop();
-                    const value = try memory.readInt(i8, @intCast(addr.i32 + @as(i32, @intCast(offset))));
+                    const value = try memory.readInt(i8, try effAddr(addr.i32, offset));
                     try self.stack.push(engine.Value{ .i32 = @as(i32, value) });
                 },
                 .i32_load8_u => {
@@ -722,7 +809,7 @@ pub const Interpreter = struct {
                     _ = try readLEB128(u32, code, &pc); // alignment
                     const offset = try readLEB128(u32, code, &pc);
                     const addr = try self.stack.pop();
-                    const value = try memory.readInt(u8, @intCast(addr.i32 + @as(i32, @intCast(offset))));
+                    const value = try memory.readInt(u8, try effAddr(addr.i32, offset));
                     try self.stack.push(engine.Value{ .i32 = @as(i32, value) });
                 },
                 .i32_load16_s => {
@@ -730,7 +817,7 @@ pub const Interpreter = struct {
                     _ = try readLEB128(u32, code, &pc); // alignment
                     const offset = try readLEB128(u32, code, &pc);
                     const addr = try self.stack.pop();
-                    const value = try memory.readInt(i16, @intCast(addr.i32 + @as(i32, @intCast(offset))));
+                    const value = try memory.readInt(i16, try effAddr(addr.i32, offset));
                     try self.stack.push(engine.Value{ .i32 = @as(i32, value) });
                 },
                 .i32_load16_u => {
@@ -738,7 +825,7 @@ pub const Interpreter = struct {
                     _ = try readLEB128(u32, code, &pc); // alignment
                     const offset = try readLEB128(u32, code, &pc);
                     const addr = try self.stack.pop();
-                    const value = try memory.readInt(u16, @intCast(addr.i32 + @as(i32, @intCast(offset))));
+                    const value = try memory.readInt(u16, try effAddr(addr.i32, offset));
                     try self.stack.push(engine.Value{ .i32 = @as(i32, value) });
                 },
                 .i64_load8_s => {
@@ -746,7 +833,7 @@ pub const Interpreter = struct {
                     _ = try readLEB128(u32, code, &pc); // alignment
                     const offset = try readLEB128(u32, code, &pc);
                     const addr = try self.stack.pop();
-                    const value = try memory.readInt(i8, @intCast(addr.i32 + @as(i32, @intCast(offset))));
+                    const value = try memory.readInt(i8, try effAddr(addr.i32, offset));
                     try self.stack.push(engine.Value{ .i64 = @as(i64, value) });
                 },
                 .i64_load8_u => {
@@ -754,7 +841,7 @@ pub const Interpreter = struct {
                     _ = try readLEB128(u32, code, &pc); // alignment
                     const offset = try readLEB128(u32, code, &pc);
                     const addr = try self.stack.pop();
-                    const value = try memory.readInt(u8, @intCast(addr.i32 + @as(i32, @intCast(offset))));
+                    const value = try memory.readInt(u8, try effAddr(addr.i32, offset));
                     try self.stack.push(engine.Value{ .i64 = @as(i64, value) });
                 },
                 .i64_load16_s => {
@@ -762,7 +849,7 @@ pub const Interpreter = struct {
                     _ = try readLEB128(u32, code, &pc); // alignment
                     const offset = try readLEB128(u32, code, &pc);
                     const addr = try self.stack.pop();
-                    const value = try memory.readInt(i16, @intCast(addr.i32 + @as(i32, @intCast(offset))));
+                    const value = try memory.readInt(i16, try effAddr(addr.i32, offset));
                     try self.stack.push(engine.Value{ .i64 = @as(i64, value) });
                 },
                 .i64_load16_u => {
@@ -770,7 +857,7 @@ pub const Interpreter = struct {
                     _ = try readLEB128(u32, code, &pc); // alignment
                     const offset = try readLEB128(u32, code, &pc);
                     const addr = try self.stack.pop();
-                    const value = try memory.readInt(u16, @intCast(addr.i32 + @as(i32, @intCast(offset))));
+                    const value = try memory.readInt(u16, try effAddr(addr.i32, offset));
                     try self.stack.push(engine.Value{ .i64 = @as(i64, value) });
                 },
                 .i64_load32_s => {
@@ -778,7 +865,7 @@ pub const Interpreter = struct {
                     _ = try readLEB128(u32, code, &pc); // alignment
                     const offset = try readLEB128(u32, code, &pc);
                     const addr = try self.stack.pop();
-                    const value = try memory.readInt(i32, @intCast(addr.i32 + @as(i32, @intCast(offset))));
+                    const value = try memory.readInt(i32, try effAddr(addr.i32, offset));
                     try self.stack.push(engine.Value{ .i64 = @as(i64, value) });
                 },
                 .i64_load32_u => {
@@ -786,7 +873,7 @@ pub const Interpreter = struct {
                     _ = try readLEB128(u32, code, &pc); // alignment
                     const offset = try readLEB128(u32, code, &pc);
                     const addr = try self.stack.pop();
-                    const value = try memory.readInt(u32, @intCast(addr.i32 + @as(i32, @intCast(offset))));
+                    const value = try memory.readInt(u32, try effAddr(addr.i32, offset));
                     try self.stack.push(engine.Value{ .i64 = @as(i64, value) });
                 },
                 .i32_store => {
@@ -795,7 +882,7 @@ pub const Interpreter = struct {
                     const offset = try readLEB128(u32, code, &pc);
                     const value = try self.stack.pop();
                     const addr = try self.stack.pop();
-                    try memory.writeInt(i32, @intCast(addr.i32 + @as(i32, @intCast(offset))), value.i32);
+                    try memory.writeInt(i32, try effAddr(addr.i32, offset), value.i32);
                 },
                 .i64_store => {
                     const memory = self.instance.getMemory() orelse return error.NoMemory;
@@ -803,21 +890,21 @@ pub const Interpreter = struct {
                     const offset = try readLEB128(u32, code, &pc);
                     const value = try self.stack.pop();
                     const addr = try self.stack.pop();
-                    try memory.writeInt(i64, @intCast(addr.i32 + @as(i32, @intCast(offset))), value.i64);
+                    try memory.writeInt(i64, try effAddr(addr.i32, offset), value.i64);
                 },
                 .f32_store => {
                     const memory = self.instance.getMemory() orelse return error.NoMemory;
                     _ = try readLEB128(u32, code, &pc); // alignment
                     const offset = try readLEB128(u32, code, &pc);
                     const value = try self.stack.pop();
-                    try memory.writeInt(u32, @intCast((try self.stack.pop()).i32 + @as(i32, @intCast(offset))), @bitCast(value.f32));
+                    try memory.writeInt(u32, try effAddr((try self.stack.pop()).i32, offset), @bitCast(value.f32));
                 },
                 .f64_store => {
                     const memory = self.instance.getMemory() orelse return error.NoMemory;
                     _ = try readLEB128(u32, code, &pc); // alignment
                     const offset = try readLEB128(u32, code, &pc);
                     const value = try self.stack.pop();
-                    try memory.writeInt(u64, @intCast((try self.stack.pop()).i32 + @as(i32, @intCast(offset))), @bitCast(value.f64));
+                    try memory.writeInt(u64, try effAddr((try self.stack.pop()).i32, offset), @bitCast(value.f64));
                 },
                 .i32_store8 => {
                     const memory = self.instance.getMemory() orelse return error.NoMemory;
@@ -825,7 +912,7 @@ pub const Interpreter = struct {
                     const offset = try readLEB128(u32, code, &pc);
                     const value = try self.stack.pop();
                     const addr = try self.stack.pop();
-                    try memory.writeInt(u8, @intCast(addr.i32 + @as(i32, @intCast(offset))), @truncate(@as(u32, @bitCast(value.i32))));
+                    try memory.writeInt(u8, try effAddr(addr.i32, offset), @truncate(@as(u32, @bitCast(value.i32))));
                 },
                 .i32_store16 => {
                     const memory = self.instance.getMemory() orelse return error.NoMemory;
@@ -833,7 +920,7 @@ pub const Interpreter = struct {
                     const offset = try readLEB128(u32, code, &pc);
                     const value = try self.stack.pop();
                     const addr = try self.stack.pop();
-                    try memory.writeInt(u16, @intCast(addr.i32 + @as(i32, @intCast(offset))), @truncate(@as(u32, @bitCast(value.i32))));
+                    try memory.writeInt(u16, try effAddr(addr.i32, offset), @truncate(@as(u32, @bitCast(value.i32))));
                 },
                 .i64_store8 => {
                     const memory = self.instance.getMemory() orelse return error.NoMemory;
@@ -841,7 +928,7 @@ pub const Interpreter = struct {
                     const offset = try readLEB128(u32, code, &pc);
                     const value = try self.stack.pop();
                     const addr = try self.stack.pop();
-                    try memory.writeInt(u8, @intCast(addr.i32 + @as(i32, @intCast(offset))), @truncate(@as(u64, @bitCast(value.i64))));
+                    try memory.writeInt(u8, try effAddr(addr.i32, offset), @truncate(@as(u64, @bitCast(value.i64))));
                 },
                 .i64_store16 => {
                     const memory = self.instance.getMemory() orelse return error.NoMemory;
@@ -849,7 +936,7 @@ pub const Interpreter = struct {
                     const offset = try readLEB128(u32, code, &pc);
                     const value = try self.stack.pop();
                     const addr = try self.stack.pop();
-                    try memory.writeInt(u16, @intCast(addr.i32 + @as(i32, @intCast(offset))), @truncate(@as(u64, @bitCast(value.i64))));
+                    try memory.writeInt(u16, try effAddr(addr.i32, offset), @truncate(@as(u64, @bitCast(value.i64))));
                 },
                 .i64_store32 => {
                     const memory = self.instance.getMemory() orelse return error.NoMemory;
@@ -857,12 +944,15 @@ pub const Interpreter = struct {
                     const offset = try readLEB128(u32, code, &pc);
                     const value = try self.stack.pop();
                     const addr = try self.stack.pop();
-                    try memory.writeInt(u32, @intCast(addr.i32 + @as(i32, @intCast(offset))), @truncate(@as(u64, @bitCast(value.i64))));
+                    try memory.writeInt(u32, try effAddr(addr.i32, offset), @truncate(@as(u64, @bitCast(value.i64))));
                 },
                 .memory_size => {
                     const memory = self.instance.getMemory() orelse return error.NoMemory;
                     _ = try readLEB128(u32, code, &pc); // reserved byte (always 0x00)
-                    try self.stack.push(engine.Value{ .i32 = @intCast(memory.size() / 65536) });
+                    // `Memory.size()` already returns the count in 64 KiB WASM
+                    // pages, which is exactly what `memory.size` yields per the
+                    // spec — do not divide by the page size again.
+                    try self.stack.push(engine.Value{ .i32 = @intCast(memory.size()) });
                 },
                 .memory_grow => {
                     const memory = self.instance.getMemory() orelse return error.NoMemory;
@@ -888,7 +978,10 @@ pub const Interpreter = struct {
                 },
 
                 else => {
-                    std.debug.print("Unimplemented opcode: 0x{x:0>2}\n", .{@intFromEnum(opcode)});
+                    // Any opcode outside the implemented MVP subset (floats,
+                    // most i64 ops, table/bulk-memory, SIMD, …) fails closed
+                    // rather than being silently skipped: a module is never
+                    // partially executed with instructions quietly dropped.
                     return error.UnimplementedOpcode;
                 },
             }
@@ -908,6 +1001,17 @@ pub const Interpreter = struct {
         return result;
     }
 };
+
+/// Compute a WASM linear-memory effective address: the popped base operand
+/// (reinterpreted as u32 per the spec) plus the static `offset` immediate.
+/// The addition is checked in u32 with `@addWithOverflow`, so a hostile
+/// base/offset pair yields `error.OutOfBounds` in every build mode rather than
+/// panicking on i32 overflow or on `@intCast` of a negative address — both of
+/// which the old `@intCast(base + @intCast(offset))` form did in safe builds.
+fn effAddr(base: i32, offset: u32) !u32 {
+    const b: u32 = @bitCast(base);
+    return std.math.add(u32, b, offset) catch return error.OutOfBounds;
+}
 
 /// Read LEB128 encoded integer
 fn readLEB128(comptime T: type, data: []const u8, pc: *usize) !T {
@@ -960,4 +1064,623 @@ test "interpreter basic arithmetic" {
 
     try std.testing.expectEqual(@as(usize, 1), results.len);
     try std.testing.expectEqual(@as(i32, 42), results[0].i32);
+}
+
+test "a direct call fails closed instead of silently mis-executing" {
+    // Regression guard for the removed log-only `.call`: the interpreter has no
+    // call-frame machinery, so a module that performs a call must be rejected
+    // (error.UnsupportedCall) rather than printing the index and running on with
+    // a corrupt operand stack. The push before the call proves the pre-call
+    // stack state is irrelevant — the call itself refuses.
+    const allocator = std.testing.allocator;
+    var instance = engine.Instance.init(allocator);
+    defer instance.deinit();
+    var interp = try Interpreter.init(allocator, &instance, 0);
+    defer interp.deinit();
+
+    const bytecode = [_]u8{
+        @intFromEnum(Opcode.i32_const), 7, // i32.const 7
+        @intFromEnum(Opcode.call), 0, // call 0
+        @intFromEnum(Opcode.end),
+    };
+    try std.testing.expectError(error.UnsupportedCall, interp.execute(&bytecode));
+}
+
+test "an indirect call fails closed instead of silently mis-executing" {
+    // Companion to the direct-call guard: `.call_indirect` likewise refuses.
+    const allocator = std.testing.allocator;
+    var instance = engine.Instance.init(allocator);
+    defer instance.deinit();
+    var interp = try Interpreter.init(allocator, &instance, 0);
+    defer interp.deinit();
+
+    const bytecode = [_]u8{
+        @intFromEnum(Opcode.i32_const), 0, // table slot
+        @intFromEnum(Opcode.call_indirect), 0, 0, // type idx, table idx
+        @intFromEnum(Opcode.end),
+    };
+    try std.testing.expectError(error.UnsupportedIndirectCall, interp.execute(&bytecode));
+}
+
+test "an unimplemented opcode fails closed rather than being skipped" {
+    // A module using an opcode outside the implemented MVP subset (here f32.add,
+    // 0x92) must abort with error.UnimplementedOpcode, not silently advance and
+    // partially execute. Guards item "reject unsupported opcodes; do not
+    // partially execute a module while silently skipping instructions".
+    const allocator = std.testing.allocator;
+    var instance = engine.Instance.init(allocator);
+    defer instance.deinit();
+    var interp = try Interpreter.init(allocator, &instance, 0);
+    defer interp.deinit();
+
+    const bytecode = [_]u8{
+        0x92, // f32.add — recognized WASM opcode, not implemented here
+        @intFromEnum(Opcode.end),
+    };
+    try std.testing.expectError(error.UnimplementedOpcode, interp.execute(&bytecode));
+}
+
+test "operand stack depth is bounded" {
+    const allocator = std.testing.allocator;
+    var stack = Stack.init(allocator);
+    defer stack.deinit();
+
+    var i: usize = 0;
+    while (i < limits.max_value_stack) : (i += 1) {
+        try stack.push(engine.Value{ .i32 = 0 });
+    }
+    // One past the ceiling must fail closed rather than growing memory.
+    try std.testing.expectError(error.StackOverflow, stack.push(engine.Value{ .i32 = 0 }));
+}
+
+test "control nesting depth is bounded" {
+    const allocator = std.testing.allocator;
+    var instance = engine.Instance.init(allocator);
+    defer instance.deinit();
+    var interp = try Interpreter.init(allocator, &instance, 0);
+    defer interp.deinit();
+
+    const frame = ControlFrame{
+        .opcode = .block,
+        .start_pc = 0,
+        .end_pc = 0,
+        .stack_height = 0,
+        .else_pc = null,
+    };
+    var i: usize = 0;
+    while (i < limits.max_control_depth) : (i += 1) {
+        try interp.pushControl(frame);
+    }
+    try std.testing.expectError(error.CallStackExhausted, interp.pushControl(frame));
+}
+
+test "setGlobal rejects an out-of-range index instead of mass-allocating" {
+    const allocator = std.testing.allocator;
+    var instance = engine.Instance.init(allocator);
+    defer instance.deinit();
+    var interp = try Interpreter.init(allocator, &instance, 0);
+    defer interp.deinit();
+
+    // A hostile index would otherwise append billions of zero globals.
+    try std.testing.expectError(
+        error.InvalidGlobalIndex,
+        interp.setGlobal(0xFFFF_FFFF, engine.Value{ .i32 = 1 }),
+    );
+}
+
+test "br_table target count is bounded" {
+    const allocator = std.testing.allocator;
+    var instance = engine.Instance.init(allocator);
+    defer instance.deinit();
+    var interp = try Interpreter.init(allocator, &instance, 0);
+    defer interp.deinit();
+
+    // br_table with a u32-max LEB128 count (0xFFFFFFFF) must be rejected
+    // before the target-decoding loop allocates.
+    const bytecode = [_]u8{
+        @intFromEnum(Opcode.br_table),
+        0xFF, 0xFF, 0xFF, 0xFF, 0x0F, // LEB128 0xFFFF_FFFF
+    };
+    try std.testing.expectError(error.TooManyBranchTargets, interp.execute(&bytecode));
+}
+
+test "load effective address overflow fails closed" {
+    const allocator = std.testing.allocator;
+    var instance = engine.Instance.init(allocator);
+    defer instance.deinit();
+
+    // Give the instance a small memory so a valid load path exists.
+    const mem = try allocator.create(engine.Memory);
+    mem.* = try engine.Memory.init(allocator, 1, 1);
+    instance.memory = mem;
+
+    var interp = try Interpreter.init(allocator, &instance, 0);
+    defer interp.deinit();
+
+    // i32.const 0xFFFFFFFF; i32.load align=0 offset=16  -> base+offset wraps u32
+    // Old code: @intCast(negative i32) panics in safe builds. Now: OutOfBounds.
+    const bytecode = [_]u8{
+        @intFromEnum(Opcode.i32_const), 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, // -1
+        @intFromEnum(Opcode.i32_load), 0x00, 0x10, // align=0, offset=16
+        @intFromEnum(Opcode.end),
+    };
+    try std.testing.expectError(error.OutOfBounds, interp.execute(&bytecode));
+}
+
+test "effAddr rejects u32 overflow but resolves valid addresses" {
+    try std.testing.expectEqual(@as(u32, 132), try effAddr(100, 32));
+    try std.testing.expectError(error.OutOfBounds, effAddr(-1, 1)); // 0xFFFFFFFF + 1
+    try std.testing.expectError(error.OutOfBounds, effAddr(@bitCast(@as(u32, 0xFFFF_FFF0)), 0x20));
+}
+
+test "instruction budget aborts an unbounded loop" {
+    const allocator = std.testing.allocator;
+    var instance = engine.Instance.init(allocator);
+    defer instance.deinit();
+    var interp = try Interpreter.init(allocator, &instance, 0);
+    defer interp.deinit();
+    interp.fuel_limit = 10_000; // tighten so the test is fast
+
+    // loop { br 0 } — an infinite loop that must be aborted by fuel, not hang.
+    const bytecode = [_]u8{
+        @intFromEnum(Opcode.loop), 0x40, // loop, empty block type
+        @intFromEnum(Opcode.br),  0x00, // br 0 -> back to loop start
+        @intFromEnum(Opcode.end),
+    };
+    try std.testing.expectError(error.InstructionBudgetExceeded, interp.execute(&bytecode));
+}
+
+test "a bound policy tightens the interpreter's control-depth ceiling" {
+    // A restrictive policy's max_stack_depth must actually cap control-frame
+    // nesting during execution, not merely exist as a standalone check. With
+    // the policy bound, the (much larger) hardcoded limits.max_control_depth is
+    // superseded: the 9th push past a depth-8 policy fails closed.
+    const allocator = std.testing.allocator;
+    var instance = engine.Instance.init(allocator);
+    defer instance.deinit();
+
+    var policy = policy_mod.WasmPolicy.init(allocator);
+    defer policy.deinit();
+    policy.max_stack_depth = 8;
+
+    var interp = try Interpreter.init(allocator, &instance, 0);
+    defer interp.deinit();
+    interp.bindPolicy(&policy);
+    try std.testing.expectEqual(@as(usize, 8), interp.control_depth_limit);
+
+    const frame = ControlFrame{
+        .opcode = .block,
+        .start_pc = 0,
+        .end_pc = 0,
+        .stack_height = 0,
+        .else_pc = null,
+    };
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        try interp.pushControl(frame);
+    }
+    try std.testing.expectError(error.CallStackExhausted, interp.pushControl(frame));
+}
+
+test "a bound policy lowers the interpreter's instruction budget" {
+    // The policy's max_instructions must tighten (never raise) the fuel budget,
+    // and the lowered budget must actually abort a runaway loop.
+    const allocator = std.testing.allocator;
+    var instance = engine.Instance.init(allocator);
+    defer instance.deinit();
+
+    var policy = policy_mod.WasmPolicy.init(allocator);
+    defer policy.deinit();
+    policy.max_instructions = 100;
+
+    var interp = try Interpreter.init(allocator, &instance, 0);
+    defer interp.deinit();
+    interp.bindPolicy(&policy);
+    try std.testing.expectEqual(@as(u64, 100), interp.fuel_limit);
+
+    const bytecode = [_]u8{
+        @intFromEnum(Opcode.loop), 0x40, // loop, empty block type
+        @intFromEnum(Opcode.br),  0x00, // br 0 -> spin
+        @intFromEnum(Opcode.end),
+    };
+    try std.testing.expectError(error.InstructionBudgetExceeded, interp.execute(&bytecode));
+}
+
+test "a bound policy clamps the instance memory page ceiling" {
+    // A restrictive policy (10 MB = 160 pages) must clamp linear-memory growth
+    // even when the module declared a larger maximum. Growth up to the policy
+    // cap succeeds; one page past it fails closed via memory.grow.
+    const allocator = std.testing.allocator;
+    var instance = engine.Instance.init(allocator);
+    defer instance.deinit();
+
+    // Module declares 1 min / 1024 max pages — far above the policy budget.
+    const mem = try allocator.create(engine.Memory);
+    mem.* = try engine.Memory.init(allocator, 1, 1024);
+    instance.memory = mem;
+
+    var policy = policy_mod.WasmPolicy.restrictive(allocator);
+    defer policy.deinit();
+
+    var interp = try Interpreter.init(allocator, &instance, 0);
+    defer interp.deinit();
+    interp.bindPolicy(&policy);
+
+    try std.testing.expectEqual(@as(?u32, 160), mem.max_pages);
+    _ = try mem.grow(159); // 1 -> 160 pages, exactly the policy ceiling
+    try std.testing.expectError(error.MemoryGrowFailed, mem.grow(1));
+}
+
+// ---------------------------------------------------------------------------
+// MVP behavioral conformance battery (item 1481).
+//
+// These tests pin the *observable semantics* of the interpreter's supported
+// bytecode subset (arithmetic/bitwise/shift/rotate, comparisons, i64 ops,
+// locals, globals, control flow, and linear-memory load/store) plus its
+// fail-closed reaction to malformed and adversarial bytecode. They are written
+// against raw bytecode because the engine has no binary module parser yet, so
+// the official `.wast` conformance corpus cannot be driven end-to-end; that
+// remains deferred to the binary-parser work (item 1407). What CAN be locked
+// in is that every opcode this interpreter claims to implement produces the
+// spec result, and that anything outside the subset — or any truncated/overlong
+// immediate — is rejected rather than silently mis-executed.
+
+/// Run a self-contained program with no locals/memory and return its single
+/// i32 result. Errors propagate so `expectError` can assert fail-closed cases.
+fn execI32(allocator: std.mem.Allocator, code: []const u8) !i32 {
+    var instance = engine.Instance.init(allocator);
+    defer instance.deinit();
+    var interp = try Interpreter.init(allocator, &instance, 0);
+    defer interp.deinit();
+    const results = try interp.execute(code);
+    defer allocator.free(results);
+    return results[0].i32;
+}
+
+/// i64 counterpart of `execI32`.
+fn execI64(allocator: std.mem.Allocator, code: []const u8) !i64 {
+    var instance = engine.Instance.init(allocator);
+    defer instance.deinit();
+    var interp = try Interpreter.init(allocator, &instance, 0);
+    defer interp.deinit();
+    const results = try interp.execute(code);
+    defer allocator.free(results);
+    return results[0].i64;
+}
+
+/// Run a program against a fresh linear memory. Caller frees the result slice.
+fn execMem(allocator: std.mem.Allocator, min_pages: u32, max_pages: ?u32, code: []const u8) ![]engine.Value {
+    var instance = engine.Instance.init(allocator);
+    defer instance.deinit();
+    const mem = try allocator.create(engine.Memory);
+    mem.* = try engine.Memory.init(allocator, min_pages, max_pages);
+    instance.memory = mem;
+    var interp = try Interpreter.init(allocator, &instance, 0);
+    defer interp.deinit();
+    return interp.execute(code);
+}
+
+test "i32 arithmetic opcodes compute spec results" {
+    const a = std.testing.allocator;
+    const O = Opcode;
+    // sub: 40 - 2 = 38
+    try std.testing.expectEqual(@as(i32, 38), try execI32(a, &[_]u8{
+        @intFromEnum(O.i32_const), 40, @intFromEnum(O.i32_const), 2, @intFromEnum(O.i32_sub), @intFromEnum(O.end),
+    }));
+    // mul: 6 * 7 = 42
+    try std.testing.expectEqual(@as(i32, 42), try execI32(a, &[_]u8{
+        @intFromEnum(O.i32_const), 6, @intFromEnum(O.i32_const), 7, @intFromEnum(O.i32_mul), @intFromEnum(O.end),
+    }));
+    // div_s: 42 / 6 = 7 (signed truncating)
+    try std.testing.expectEqual(@as(i32, 7), try execI32(a, &[_]u8{
+        @intFromEnum(O.i32_const), 42, @intFromEnum(O.i32_const), 6, @intFromEnum(O.i32_div_s), @intFromEnum(O.end),
+    }));
+    // div_u: (-2 as u32 = 0xFFFF_FFFE) / 2 = 0x7FFF_FFFF, distinct from div_s.
+    try std.testing.expectEqual(@as(i32, 2147483647), try execI32(a, &[_]u8{
+        @intFromEnum(O.i32_const), 0x7E, @intFromEnum(O.i32_const), 2, @intFromEnum(O.i32_div_u), @intFromEnum(O.end),
+    }));
+    // rem_s: 43 % 5 = 3
+    try std.testing.expectEqual(@as(i32, 3), try execI32(a, &[_]u8{
+        @intFromEnum(O.i32_const), 43, @intFromEnum(O.i32_const), 5, @intFromEnum(O.i32_rem_s), @intFromEnum(O.end),
+    }));
+}
+
+test "i32 bitwise and shift opcodes compute spec results" {
+    const a = std.testing.allocator;
+    const O = Opcode;
+    // and: 6 & 3 = 2
+    try std.testing.expectEqual(@as(i32, 2), try execI32(a, &[_]u8{
+        @intFromEnum(O.i32_const), 6, @intFromEnum(O.i32_const), 3, @intFromEnum(O.i32_and), @intFromEnum(O.end),
+    }));
+    // or: 4 | 1 = 5
+    try std.testing.expectEqual(@as(i32, 5), try execI32(a, &[_]u8{
+        @intFromEnum(O.i32_const), 4, @intFromEnum(O.i32_const), 1, @intFromEnum(O.i32_or), @intFromEnum(O.end),
+    }));
+    // xor: 5 ^ 3 = 6
+    try std.testing.expectEqual(@as(i32, 6), try execI32(a, &[_]u8{
+        @intFromEnum(O.i32_const), 5, @intFromEnum(O.i32_const), 3, @intFromEnum(O.i32_xor), @intFromEnum(O.end),
+    }));
+    // shl with a shift count of 33: the spec masks the count mod 32, so
+    // 1 << 33 behaves as 1 << 1 = 2 rather than shifting out to 0.
+    try std.testing.expectEqual(@as(i32, 2), try execI32(a, &[_]u8{
+        @intFromEnum(O.i32_const), 1, @intFromEnum(O.i32_const), 33, @intFromEnum(O.i32_shl), @intFromEnum(O.end),
+    }));
+    // shr_u: 8 >> 2 = 2
+    try std.testing.expectEqual(@as(i32, 2), try execI32(a, &[_]u8{
+        @intFromEnum(O.i32_const), 8, @intFromEnum(O.i32_const), 2, @intFromEnum(O.i32_shr_u), @intFromEnum(O.end),
+    }));
+}
+
+test "i32 bit-count and eqz opcodes compute spec results" {
+    const a = std.testing.allocator;
+    const O = Opcode;
+    // clz(1) = 31
+    try std.testing.expectEqual(@as(i32, 31), try execI32(a, &[_]u8{
+        @intFromEnum(O.i32_const), 1, @intFromEnum(O.i32_clz), @intFromEnum(O.end),
+    }));
+    // ctz(8) = 3
+    try std.testing.expectEqual(@as(i32, 3), try execI32(a, &[_]u8{
+        @intFromEnum(O.i32_const), 8, @intFromEnum(O.i32_ctz), @intFromEnum(O.end),
+    }));
+    // popcnt(7) = 3
+    try std.testing.expectEqual(@as(i32, 3), try execI32(a, &[_]u8{
+        @intFromEnum(O.i32_const), 7, @intFromEnum(O.i32_popcnt), @intFromEnum(O.end),
+    }));
+    // eqz(0) = 1
+    try std.testing.expectEqual(@as(i32, 1), try execI32(a, &[_]u8{
+        @intFromEnum(O.i32_const), 0, @intFromEnum(O.i32_eqz), @intFromEnum(O.end),
+    }));
+}
+
+test "i32 comparisons distinguish signed and unsigned operands" {
+    const a = std.testing.allocator;
+    const O = Opcode;
+    // lt_s(-1, 1) = 1 : signed, -1 < 1.
+    try std.testing.expectEqual(@as(i32, 1), try execI32(a, &[_]u8{
+        @intFromEnum(O.i32_const), 0x7F, @intFromEnum(O.i32_const), 1, @intFromEnum(O.i32_lt_s), @intFromEnum(O.end),
+    }));
+    // lt_u(0xFFFF_FFFF, 1) = 0 : unsigned, 0xFFFF_FFFF is the largest value.
+    try std.testing.expectEqual(@as(i32, 0), try execI32(a, &[_]u8{
+        @intFromEnum(O.i32_const), 0x7F, @intFromEnum(O.i32_const), 1, @intFromEnum(O.i32_lt_u), @intFromEnum(O.end),
+    }));
+    // gt_u(0xFFFF_FFFF, 1) = 1
+    try std.testing.expectEqual(@as(i32, 1), try execI32(a, &[_]u8{
+        @intFromEnum(O.i32_const), 0x7F, @intFromEnum(O.i32_const), 1, @intFromEnum(O.i32_gt_u), @intFromEnum(O.end),
+    }));
+    // eq(5, 5) = 1 ; ne(5, 4) = 1
+    try std.testing.expectEqual(@as(i32, 1), try execI32(a, &[_]u8{
+        @intFromEnum(O.i32_const), 5, @intFromEnum(O.i32_const), 5, @intFromEnum(O.i32_eq), @intFromEnum(O.end),
+    }));
+    try std.testing.expectEqual(@as(i32, 1), try execI32(a, &[_]u8{
+        @intFromEnum(O.i32_const), 5, @intFromEnum(O.i32_const), 4, @intFromEnum(O.i32_ne), @intFromEnum(O.end),
+    }));
+}
+
+test "i64 arithmetic and eqz compute spec results" {
+    const a = std.testing.allocator;
+    const O = Opcode;
+    // add/sub/mul all land on 42.
+    try std.testing.expectEqual(@as(i64, 42), try execI64(a, &[_]u8{
+        @intFromEnum(O.i64_const), 40, @intFromEnum(O.i64_const), 2, @intFromEnum(O.i64_add), @intFromEnum(O.end),
+    }));
+    try std.testing.expectEqual(@as(i64, 42), try execI64(a, &[_]u8{
+        @intFromEnum(O.i64_const), 50, @intFromEnum(O.i64_const), 8, @intFromEnum(O.i64_sub), @intFromEnum(O.end),
+    }));
+    try std.testing.expectEqual(@as(i64, 42), try execI64(a, &[_]u8{
+        @intFromEnum(O.i64_const), 6, @intFromEnum(O.i64_const), 7, @intFromEnum(O.i64_mul), @intFromEnum(O.end),
+    }));
+    // i64.eqz pushes an i32 boolean.
+    try std.testing.expectEqual(@as(i32, 1), try execI32(a, &[_]u8{
+        @intFromEnum(O.i64_const), 0, @intFromEnum(O.i64_eqz), @intFromEnum(O.end),
+    }));
+}
+
+test "local get/set/tee round-trip through the locals frame" {
+    const allocator = std.testing.allocator;
+    const O = Opcode;
+    var instance = engine.Instance.init(allocator);
+    defer instance.deinit();
+    var interp = try Interpreter.init(allocator, &instance, 1); // one local
+    defer interp.deinit();
+
+    // local0 = 42; push 7; local.tee 0 (writes local0=7, leaves 7 on stack);
+    // local.get 0 pushes the freshly written 7 -> stack [7, 7]. Proves set
+    // overwrote the initial 42 and tee both wrote-through and preserved the top.
+    const code = [_]u8{
+        @intFromEnum(O.i32_const), 42, @intFromEnum(O.local_set), 0,
+        @intFromEnum(O.i32_const), 7,  @intFromEnum(O.local_tee), 0,
+        @intFromEnum(O.local_get), 0,  @intFromEnum(O.end),
+    };
+    const results = try interp.execute(&code);
+    defer allocator.free(results);
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expectEqual(@as(i32, 7), results[0].i32);
+    try std.testing.expectEqual(@as(i32, 7), results[1].i32);
+}
+
+test "global set/get round-trip" {
+    const a = std.testing.allocator;
+    const O = Opcode;
+    // global0 = 30; global.get 0 -> 30.
+    try std.testing.expectEqual(@as(i32, 30), try execI32(a, &[_]u8{
+        @intFromEnum(O.i32_const),  30, @intFromEnum(O.global_set), 0,
+        @intFromEnum(O.global_get), 0,  @intFromEnum(O.end),
+    }));
+}
+
+test "if/else selects the correct arm on the condition" {
+    const a = std.testing.allocator;
+    const O = Opcode;
+    // condition true -> then-arm (10)
+    try std.testing.expectEqual(@as(i32, 10), try execI32(a, &[_]u8{
+        @intFromEnum(O.i32_const), 1,                   @intFromEnum(O.if_),   0x40,
+        @intFromEnum(O.i32_const), 10,                  @intFromEnum(O.else_), @intFromEnum(O.i32_const),
+        20,                        @intFromEnum(O.end),
+    }));
+    // condition false -> else-arm (20)
+    try std.testing.expectEqual(@as(i32, 20), try execI32(a, &[_]u8{
+        @intFromEnum(O.i32_const), 0,                   @intFromEnum(O.if_),   0x40,
+        @intFromEnum(O.i32_const), 10,                  @intFromEnum(O.else_), @intFromEnum(O.i32_const),
+        20,                        @intFromEnum(O.end),
+    }));
+}
+
+test "a terminating loop with br_if runs the expected iterations" {
+    const allocator = std.testing.allocator;
+    const O = Opcode;
+    var instance = engine.Instance.init(allocator);
+    defer instance.deinit();
+    var interp = try Interpreter.init(allocator, &instance, 1); // counter local
+    defer interp.deinit();
+
+    // local0 = 3 (counter); global0 = 0 (accumulator)
+    // loop: global0 += 1; local0 -= 1; br_if 0 while local0 != 0
+    // after loop: global.get 0 -> 3 (loop body ran exactly 3 times, terminating).
+    const code = [_]u8{
+        @intFromEnum(O.i32_const), 3,                         @intFromEnum(O.local_set),  0,
+        @intFromEnum(O.i32_const), 0,                         @intFromEnum(O.global_set), 0,
+        @intFromEnum(O.loop),      0x40,                      @intFromEnum(O.global_get), 0,
+        @intFromEnum(O.i32_const), 1,                         @intFromEnum(O.i32_add),    @intFromEnum(O.global_set),
+        0,                         @intFromEnum(O.local_get), 0,                          @intFromEnum(O.i32_const),
+        1,                         @intFromEnum(O.i32_sub),   @intFromEnum(O.local_tee),  0,
+        @intFromEnum(O.br_if),     0,                         @intFromEnum(O.end),        @intFromEnum(O.global_get),
+        0,
+    };
+    const results = try interp.execute(&code);
+    defer allocator.free(results);
+    try std.testing.expectEqual(@as(i32, 3), results[results.len - 1].i32);
+}
+
+test "i32 load/store round-trips through linear memory" {
+    const allocator = std.testing.allocator;
+    const O = Opcode;
+    // store 42 at address 0, then load it back.
+    const code = [_]u8{
+        @intFromEnum(O.i32_const), 0, @intFromEnum(O.i32_const), 42,   @intFromEnum(O.i32_store), 0x00,                0x00,
+        @intFromEnum(O.i32_const), 0, @intFromEnum(O.i32_load),  0x00, 0x00,                      @intFromEnum(O.end),
+    };
+    const results = try execMem(allocator, 1, 4, &code);
+    defer allocator.free(results);
+    try std.testing.expectEqual(@as(i32, 42), results[0].i32);
+}
+
+test "sub-word store truncates and load sign-extends" {
+    const allocator = std.testing.allocator;
+    const O = Opcode;
+    // store byte 128 (0x80) at address 0, then read it back both ways:
+    // load8_u -> 128 (zero-extended), load8_s -> -128 (sign-extended).
+    const code = [_]u8{
+        @intFromEnum(O.i32_const), 0,    @intFromEnum(O.i32_const),   0x80, 0x01, @intFromEnum(O.i32_store8), 0x00, 0x00,
+        @intFromEnum(O.i32_const), 0,    @intFromEnum(O.i32_load8_u), 0x00, 0x00, @intFromEnum(O.i32_const),  0,    @intFromEnum(O.i32_load8_s),
+        0x00,                      0x00, @intFromEnum(O.end),
+    };
+    const results = try execMem(allocator, 1, 4, &code);
+    defer allocator.free(results);
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expectEqual(@as(i32, 128), results[0].i32);
+    try std.testing.expectEqual(@as(i32, -128), results[1].i32);
+}
+
+test "memory.size reports pages and memory.grow returns the old page count" {
+    const allocator = std.testing.allocator;
+    const O = Opcode;
+    // memory.size on a 1-page memory must report 1 page — regression guard for
+    // the double `/ 65536` that made a 1-page memory report 0.
+    const size_code = [_]u8{ @intFromEnum(O.memory_size), 0x00, @intFromEnum(O.end) };
+    const size_results = try execMem(allocator, 1, 4, &size_code);
+    defer allocator.free(size_results);
+    try std.testing.expectEqual(@as(i32, 1), size_results[0].i32);
+
+    // grow by 2 pages: memory.grow returns the old size (1), memory.size is now 3.
+    const grow_code = [_]u8{
+        @intFromEnum(O.i32_const),   2,    @intFromEnum(O.memory_grow), 0x00,
+        @intFromEnum(O.memory_size), 0x00, @intFromEnum(O.end),
+    };
+    const grow_results = try execMem(allocator, 1, 4, &grow_code);
+    defer allocator.free(grow_results);
+    try std.testing.expectEqual(@as(usize, 2), grow_results.len);
+    try std.testing.expectEqual(@as(i32, 1), grow_results[0].i32); // old page count
+    try std.testing.expectEqual(@as(i32, 3), grow_results[1].i32); // new page count
+}
+
+test "memory.grow past the maximum returns -1 without trapping" {
+    const allocator = std.testing.allocator;
+    const O = Opcode;
+    // Growing a 1-page/1-page-max memory by 5 must fail per spec by pushing -1,
+    // not by trapping or actually allocating.
+    const code = [_]u8{
+        @intFromEnum(O.i32_const), 5, @intFromEnum(O.memory_grow), 0x00, @intFromEnum(O.end),
+    };
+    const results = try execMem(allocator, 1, 1, &code);
+    defer allocator.free(results);
+    try std.testing.expectEqual(@as(i32, -1), results[0].i32);
+}
+
+test "a truncated LEB128 immediate fails closed" {
+    // i32.const with a continuation byte but no following byte: the decoder must
+    // stop with UnexpectedEnd rather than reading past the code slice.
+    const a = std.testing.allocator;
+    try std.testing.expectError(error.UnexpectedEnd, execI32(a, &[_]u8{
+        @intFromEnum(Opcode.i32_const), 0x80,
+    }));
+}
+
+test "an overlong LEB128 immediate fails closed" {
+    // Five continuation bytes for an i32 immediate exceed the maximum encoding
+    // length and must be rejected as InvalidLEB128, not decoded to a garbage
+    // value.
+    const a = std.testing.allocator;
+    try std.testing.expectError(error.InvalidLEB128, execI32(a, &[_]u8{
+        @intFromEnum(Opcode.i32_const), 0x80, 0x80, 0x80, 0x80, 0x80,
+    }));
+}
+
+test "a truncated f32.const immediate fails closed" {
+    const a = std.testing.allocator;
+    // f32.const needs 4 little-endian bytes; only 2 are present.
+    try std.testing.expectError(error.UnexpectedEnd, execI32(a, &[_]u8{
+        @intFromEnum(Opcode.f32_const), 0x00, 0x00,
+    }));
+}
+
+test "a truncated f64.const immediate fails closed" {
+    const a = std.testing.allocator;
+    // f64.const needs 8 little-endian bytes; only 1 is present.
+    try std.testing.expectError(error.UnexpectedEnd, execI32(a, &[_]u8{
+        @intFromEnum(Opcode.f64_const), 0x00,
+    }));
+}
+
+test "popping an empty operand stack fails closed" {
+    const a = std.testing.allocator;
+    // i32.add with nothing on the stack must underflow, not read stale memory.
+    try std.testing.expectError(error.StackUnderflow, execI32(a, &[_]u8{
+        @intFromEnum(Opcode.i32_add), @intFromEnum(Opcode.end),
+    }));
+}
+
+test "integer division and remainder by zero trap" {
+    const a = std.testing.allocator;
+    const O = Opcode;
+    try std.testing.expectError(error.DivisionByZero, execI32(a, &[_]u8{
+        @intFromEnum(O.i32_const), 5, @intFromEnum(O.i32_const), 0, @intFromEnum(O.i32_div_s), @intFromEnum(O.end),
+    }));
+    try std.testing.expectError(error.DivisionByZero, execI32(a, &[_]u8{
+        @intFromEnum(O.i32_const), 5, @intFromEnum(O.i32_const), 0, @intFromEnum(O.i32_rem_s), @intFromEnum(O.end),
+    }));
+}
+
+test "the unreachable opcode traps" {
+    const a = std.testing.allocator;
+    try std.testing.expectError(error.Unreachable, execI32(a, &[_]u8{
+        @intFromEnum(Opcode.unreachable_), @intFromEnum(Opcode.end),
+    }));
+}
+
+test "an out-of-range local index fails closed" {
+    const a = std.testing.allocator;
+    // local.get 0 with zero locals declared must be rejected, not read OOB.
+    try std.testing.expectError(error.InvalidLocalIndex, execI32(a, &[_]u8{
+        @intFromEnum(Opcode.local_get), 0, @intFromEnum(Opcode.end),
+    }));
 }

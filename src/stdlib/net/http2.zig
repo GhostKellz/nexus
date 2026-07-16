@@ -4,7 +4,6 @@ const hpack = @import("hpack.zig");
 
 /// HTTP/2 implementation for gRPC support
 /// RFC 7540 - Hypertext Transfer Protocol Version 2 (HTTP/2)
-
 pub const Error = error{
     InvalidPreface,
     InvalidFrame,
@@ -26,6 +25,11 @@ pub const FrameType = enum(u8) {
     goaway = 0x7,
     window_update = 0x8,
     continuation = 0x9,
+    // Non-exhaustive: RFC 7540 §4.1 requires unknown frame types to be ignored,
+    // not rejected. Keeping this open means @enumFromInt on an unknown type byte
+    // is well-defined instead of an illegal-behavior panic, and processFrame's
+    // else-prong discards it.
+    _,
 };
 
 /// HTTP/2 frame flags
@@ -160,7 +164,7 @@ pub const Stream = struct {
             .state = .idle,
             .window_size = 65535,
             .headers = std.StringHashMap([]const u8).init(allocator),
-            .data = std.ArrayList(u8).init(allocator),
+            .data = .empty,
             .priority = Priority{},
             .allocator = allocator,
         };
@@ -173,7 +177,7 @@ pub const Stream = struct {
             self.allocator.free(entry.value_ptr.*);
         }
         self.headers.deinit();
-        self.data.deinit();
+        self.data.deinit(self.allocator);
     }
 
     pub fn updatePriority(self: *Stream, priority: Priority) void {
@@ -450,7 +454,7 @@ pub const Connection = struct {
         self.window_size -= @intCast(payload.len);
 
         // Append data to stream
-        try stream.data.appendSlice(payload);
+        try stream.data.appendSlice(stream.allocator, payload);
 
         // Update stream state
         if ((header.flags & 0x01) != 0) { // END_STREAM
@@ -487,13 +491,13 @@ pub const Connection = struct {
         }
 
         // Decode headers
-        const decoded_headers = try hpack.decodeHeaderBlock(header_data, &self.hpack_decoder, self.allocator);
+        var decoded_headers = try hpack.decodeHeaderBlock(header_data, &self.hpack_decoder, self.allocator);
         defer {
             for (decoded_headers.items) |h| {
                 self.allocator.free(h.name);
                 self.allocator.free(h.value);
             }
-            decoded_headers.deinit();
+            decoded_headers.deinit(self.allocator);
         }
 
         // Store headers in stream
@@ -598,15 +602,15 @@ pub const Connection = struct {
 
     /// Get sorted list of streams by priority
     pub fn getStreamsByPriority(self: *Connection) ![]u31 {
-        var stream_ids = std.ArrayList(u31).init(self.allocator);
-        defer stream_ids.deinit();
+        var stream_ids: std.ArrayList(u31) = .empty;
+        defer stream_ids.deinit(self.allocator);
 
         var it = self.streams.keyIterator();
         while (it.next()) |id| {
-            try stream_ids.append(id.*);
+            try stream_ids.append(self.allocator, id.*);
         }
 
-        const ids = try stream_ids.toOwnedSlice();
+        const ids = try stream_ids.toOwnedSlice(self.allocator);
 
         // Sort by weight (simplified - real implementation would use full dependency tree)
         std.sort.block(u31, ids, self, struct {
@@ -674,4 +678,53 @@ test "http2 frame header" {
     try std.testing.expectEqual(header.type, parsed.type);
     try std.testing.expectEqual(header.flags, parsed.flags);
     try std.testing.expectEqual(header.stream_id, parsed.stream_id);
+}
+
+test "http2 frame header rejects short buffer" {
+    const truncated = [_]u8{ 0x00, 0x00, 0x08, 0x00 }; // only 4 of 9 bytes
+    try std.testing.expectError(Error.InvalidFrame, FrameHeader.parse(&truncated));
+}
+
+test "http2 frame header tolerates unknown frame type" {
+    // Type byte 0xFF is not a defined frame type. Parsing it must not panic on
+    // @enumFromInt (FrameType is non-exhaustive); the value round-trips as an
+    // unnamed enum tag so processFrame's else-prong can ignore it per RFC 7540.
+    var buf = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    buf[3] = 0xFF; // frame type
+    buf[8] = 0x01; // stream id = 1
+    const parsed = try FrameHeader.parse(&buf);
+    try std.testing.expectEqual(@as(u8, 0xFF), @intFromEnum(parsed.type));
+    try std.testing.expectEqual(@as(u31, 1), parsed.stream_id);
+}
+
+test "http2 priority round-trips through the 5-byte wire form" {
+    const priority = Priority{
+        .stream_dependency = 5,
+        .weight = 20,
+        .exclusive = true,
+    };
+
+    var buffer: [5]u8 = undefined;
+    try priority.write(&buffer);
+
+    const parsed = try Priority.parse(&buffer);
+
+    try std.testing.expectEqual(priority.stream_dependency, parsed.stream_dependency);
+    try std.testing.expectEqual(priority.weight, parsed.weight);
+    try std.testing.expectEqual(priority.exclusive, parsed.exclusive);
+}
+
+test "http2 stream starts idle and tracks priority updates" {
+    const allocator = std.testing.allocator;
+
+    var stream = Stream.init(allocator, 1);
+    defer stream.deinit();
+
+    try std.testing.expectEqual(Stream.State.idle, stream.state);
+
+    stream.state = .open;
+    try std.testing.expectEqual(Stream.State.open, stream.state);
+
+    stream.updatePriority(Priority{ .weight = 30 });
+    try std.testing.expectEqual(@as(u8, 30), stream.priority.weight);
 }

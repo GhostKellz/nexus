@@ -4,7 +4,6 @@ const std = @import("std");
 ///
 /// Implements a work-stealing algorithm where idle workers can steal tasks
 /// from busy workers' queues, ensuring efficient load balancing across threads.
-
 pub const Error = error{
     SchedulerShutdown,
     QueueFull,
@@ -65,16 +64,19 @@ pub fn WorkStealingDeque(comptime T: type) type {
         pub fn push(self: *Self, task: T) !void {
             const b = self.bottom.load(.seq_cst);
             const t = self.top.load(.acquire);
-            const size = b - t;
+            const cur_size = b - t;
 
-            if (size >= @as(i64, @intCast(self.buffer.len))) {
+            if (cur_size >= @as(i64, @intCast(self.buffer.len))) {
                 return Error.QueueFull;
             }
 
             const index: usize = @intCast(@mod(b, @as(i64, @intCast(self.buffer.len))));
             self.buffer[index] = task;
 
-            std.atomic.fence(.release);
+            // Publish the task with a release store: the release ordering
+            // guarantees the preceding buffer write is visible to any thief
+            // that acquire-loads `bottom`. (std.atomic.fence was removed;
+            // the release store carries the same publication guarantee.)
             self.bottom.store(b + 1, .release);
         }
 
@@ -82,9 +84,10 @@ pub fn WorkStealingDeque(comptime T: type) type {
         pub fn pop(self: *Self) ?T {
             var b = self.bottom.load(.seq_cst);
             b -= 1;
-            self.bottom.store(b, .seq_cst);
-
-            std.atomic.fence(.seq_cst);
+            // A seq_cst read-modify-write provides the StoreLoad barrier that
+            // the removed std.atomic.fence(.seq_cst) used to supply between
+            // publishing the decremented `bottom` and loading `top`.
+            _ = self.bottom.swap(b, .seq_cst);
 
             const t = self.top.load(.seq_cst);
 
@@ -112,11 +115,11 @@ pub fn WorkStealingDeque(comptime T: type) type {
 
         /// Steal a task from the top (other workers)
         pub fn steal(self: *Self) ?T {
-            const t = self.top.load(.acquire);
-
-            std.atomic.fence(.seq_cst);
-
-            const b = self.bottom.load(.acquire);
+            // Both loads use seq_cst so they participate in the single total
+            // order that the removed std.atomic.fence(.seq_cst) established
+            // between reading `top` and `bottom`.
+            const t = self.top.load(.seq_cst);
+            const b = self.bottom.load(.seq_cst);
 
             if (t >= b) {
                 return null; // Empty
@@ -194,28 +197,51 @@ pub const Worker = struct {
 
     /// Main worker loop
     fn workerLoop(self: *Worker) void {
+        var idle_iters: u32 = 0;
         while (self.is_running.load(.acquire)) {
             // Try to get work from local queue first
             if (self.local_queue.pop()) |task| {
                 self.executeTask(task);
+                idle_iters = 0;
                 continue;
             }
 
             // Try to steal from other workers
             if (self.trySteal()) |task| {
-                _ = self.tasks_stolen.fetchAdd(1, .relaxed);
+                _ = self.tasks_stolen.fetchAdd(1, .monotonic);
                 self.executeTask(task);
+                idle_iters = 0;
                 continue;
             }
 
-            // Try global queue
-            if (self.scheduler.globalQueue.pop()) |task| {
+            // Try the global injection queue. Workers are thieves here: many
+            // may consume concurrently, so this must be steal() (multi-consumer
+            // safe via the top cmpxchg), never pop() (single-owner only).
+            if (self.scheduler.globalQueue.steal()) |task| {
                 self.executeTask(task);
+                idle_iters = 0;
                 continue;
             }
 
-            // No work available, yield
-            std.Thread.yield() catch {};
+            // No work found — back off progressively so an idle worker does not
+            // peg a core. Brief spins stay responsive to a sudden burst; then a
+            // few yields; then park on a bounded sleep. The 1ms cap keeps
+            // shutdown latency small (a parked worker observes is_running within
+            // one sleep interval after stop()).
+            idle_iters +|= 1;
+            if (idle_iters < 64) {
+                std.atomic.spinLoopHint();
+            } else if (idle_iters < 128) {
+                // yield() is a scheduling hint; a declined yield just falls
+                // through to re-check the queues, so the error is ignorable.
+                std.Thread.yield() catch {};
+            } else {
+                const duration = std.Io.Duration.fromMilliseconds(1);
+                const timeout = std.Io.Timeout{ .duration = .{ .raw = duration, .clock = .awake } };
+                // A cancelled/failed park only makes the next queue check happen
+                // sooner, which is harmless.
+                timeout.sleep(self.scheduler.io) catch {};
+            }
         }
     }
 
@@ -225,12 +251,20 @@ pub const Worker = struct {
         if (num_workers <= 1) return null;
 
         // Start from a random worker to avoid contention
-        var prng = std.Random.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
-        const start: usize = prng.random().int(usize) % num_workers;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var seed_bytes: [8]u8 = undefined;
+        io.randomSecure(&seed_bytes) catch {
+            // Entropy unavailable: fall back to worker id for a deterministic
+            // but still-spread starting offset rather than aborting a steal.
+            @memset(&seed_bytes, @truncate(self.id));
+        };
+        const seed = std.mem.readInt(u64, &seed_bytes, .little);
+        var prng = std.Random.DefaultPrng.init(seed);
+        const start_idx: usize = prng.random().int(usize) % num_workers;
 
         var i: usize = 0;
         while (i < num_workers) : (i += 1) {
-            const victim_id = (start + i) % num_workers;
+            const victim_id = (start_idx + i) % num_workers;
             if (victim_id == self.id) continue;
 
             if (self.scheduler.workers[victim_id].local_queue.steal()) |task| {
@@ -243,11 +277,25 @@ pub const Worker = struct {
 
     fn executeTask(self: *Worker, task: Task) void {
         task.func(task.context);
-        _ = self.tasks_executed.fetchAdd(1, .relaxed);
+        _ = self.tasks_executed.fetchAdd(1, .monotonic);
     }
 };
 
-/// Work-Stealing Scheduler
+/// Work-Stealing Scheduler.
+///
+/// Role in the execution model: this is a subordinate CPU-offload pool, not an
+/// independent runtime. The authoritative execution model is `EventLoop` (see
+/// `runtime/event_loop.zig`), which runs all application logic on one loop
+/// thread and owns callback-context lifetimes. This scheduler exists only to
+/// parallelize pure/CPU-bound work across worker threads.
+///
+/// Ownership boundary: task contexts submitted here are BORROWED — the
+/// submitter owns them, the scheduler frees nothing, and `shutdown` cancels
+/// (does not drain) pending tasks. Worker threads must not mutate
+/// event-loop-owned state directly; the only sanctioned way to return a result
+/// to the reactor is to call `EventLoop.submit`, which re-runs the continuation
+/// on the loop thread under the loop's ownership contract. That single seam
+/// keeps the loop authoritative and the scheduler a stateless compute helper.
 pub const Scheduler = struct {
     workers: []Worker,
     /// Global queue for tasks not assigned to specific workers
@@ -260,9 +308,17 @@ pub const Scheduler = struct {
     next_task_id: std.atomic.Value(u64),
     /// Is the scheduler running
     is_running: std.atomic.Value(bool),
-    /// Round-robin counter for task distribution
-    next_worker: std.atomic.Value(usize),
     allocator: std.mem.Allocator,
+    /// I/O handle used to park idle workers on a bounded sleep. Workers are raw
+    /// OS threads, so this degrades to a per-thread `clock_nanosleep`.
+    io: std.Io,
+    /// Producer serialization for the global queue. `push` is a single-owner
+    /// operation on the Chase–Lev deque, but `submit` may be called from many
+    /// threads; this test-and-set spinlock guarantees at most one producer
+    /// pushes at a time. Workers only `steal` the global queue (never `push`
+    /// or `pop`), and steal-vs-push is the deque's lock-free owner/thief case,
+    /// so consumers never take this lock.
+    global_producer_lock: std.atomic.Value(bool),
 
     /// Initialize scheduler with specified number of workers
     /// If num_workers is 0, uses the number of CPU cores
@@ -279,14 +335,26 @@ pub const Scheduler = struct {
             .tasks_submitted = std.atomic.Value(u64).init(0),
             .next_task_id = std.atomic.Value(u64).init(1),
             .is_running = std.atomic.Value(bool).init(false),
-            .next_worker = std.atomic.Value(usize).init(0),
             .allocator = allocator,
+            .io = std.Io.Threaded.global_single_threaded.io(),
+            .global_producer_lock = std.atomic.Value(bool).init(false),
+        };
+        // globalQueue is live now; release it if worker setup below fails.
+        errdefer scheduler.globalQueue.deinit();
+
+        // Create workers. If any Worker.init fails partway, tear down the ones
+        // already created and free the array before unwinding.
+        scheduler.workers = try allocator.alloc(Worker, actual_workers);
+        errdefer allocator.free(scheduler.workers);
+
+        var initialized: usize = 0;
+        errdefer for (scheduler.workers[0..initialized]) |*worker| {
+            worker.deinit();
         };
 
-        // Create workers
-        scheduler.workers = try allocator.alloc(Worker, actual_workers);
         for (scheduler.workers, 0..) |*worker, i| {
             worker.* = try Worker.init(allocator, i, scheduler);
+            initialized += 1;
         }
 
         return scheduler;
@@ -302,15 +370,38 @@ pub const Scheduler = struct {
         self.allocator.destroy(self);
     }
 
-    /// Start all worker threads
+    /// Start all worker threads.
+    ///
+    /// If spawning a worker fails partway, the workers already started are
+    /// signalled to stop and joined before the error unwinds, so no thread
+    /// outlives a failed `start()` (no orphaned/detached workers).
     pub fn start(self: *Scheduler) !void {
         self.is_running.store(true, .release);
+        var started: usize = 0;
+        errdefer {
+            // Partial startup: cancel and join only the workers we spawned.
+            // Un-started workers have a null thread, so their stop() is a no-op.
+            self.is_running.store(false, .release);
+            for (self.workers[0..started]) |*worker| {
+                worker.stop();
+            }
+        }
         for (self.workers) |*worker| {
             try worker.start();
+            started += 1;
         }
     }
 
-    /// Shutdown the scheduler
+    /// Shutdown the scheduler.
+    ///
+    /// Cancel semantics: this clears the running flag and joins every worker,
+    /// so each worker finishes the task it is currently executing and then
+    /// exits. Tasks still queued (local, global) are NOT drained — they are
+    /// cancelled. Task contexts are borrowed (the submitter owns them; the
+    /// scheduler never frees them), so dropping pending tasks leaks nothing the
+    /// scheduler owns. Idempotent: safe to call more than once and from
+    /// `deinit`, since a stopped worker has a null thread and re-stops as a
+    /// no-op.
     pub fn shutdown(self: *Scheduler) void {
         self.is_running.store(false, .release);
         for (self.workers) |*worker| {
@@ -333,19 +424,22 @@ pub const Scheduler = struct {
             .func = func,
             .context = context,
             .priority = priority,
-            .id = self.next_task_id.fetchAdd(1, .relaxed),
+            .id = self.next_task_id.fetchAdd(1, .monotonic),
         };
 
-        // High priority tasks go to global queue for faster pickup
-        if (priority == .critical or priority == .high) {
-            try self.globalQueue.push(task);
-        } else {
-            // Distribute to workers using round-robin
-            const worker_id = self.next_worker.fetchAdd(1, .relaxed) % self.num_workers;
-            try self.workers[worker_id].local_queue.push(task);
+        // All work is injected through the global queue. Pushing a worker's
+        // local deque from here would make the submitting thread a second owner
+        // of that deque (the worker already pushes/pops it), which the Chase–Lev
+        // algorithm forbids and which double-executes tasks under contention.
+        // push() is single-owner, so serialize concurrent submitters with the
+        // producer spinlock; workers consume via steal() and never take it.
+        while (self.global_producer_lock.cmpxchgWeak(false, true, .acquire, .monotonic)) |_| {
+            std.atomic.spinLoopHint();
         }
+        defer self.global_producer_lock.store(false, .release);
 
-        _ = self.tasks_submitted.fetchAdd(1, .relaxed);
+        try self.globalQueue.push(task);
+        _ = self.tasks_submitted.fetchAdd(1, .monotonic);
     }
 
     /// Submit a batch of tasks
@@ -362,15 +456,15 @@ pub const Scheduler = struct {
         var total_pending: usize = 0;
 
         for (self.workers) |*worker| {
-            total_executed += worker.tasks_executed.load(.relaxed);
-            total_stolen += worker.tasks_stolen.load(.relaxed);
+            total_executed += worker.tasks_executed.load(.monotonic);
+            total_stolen += worker.tasks_stolen.load(.monotonic);
             total_pending += worker.local_queue.size();
         }
 
         total_pending += self.globalQueue.size();
 
         return Stats{
-            .tasks_submitted = self.tasks_submitted.load(.relaxed),
+            .tasks_submitted = self.tasks_submitted.load(.monotonic),
             .tasks_executed = total_executed,
             .tasks_stolen = total_stolen,
             .tasks_pending = total_pending,
@@ -387,7 +481,15 @@ pub const Scheduler = struct {
     };
 };
 
-/// Parallel for-each helper
+/// Parallel for-each helper.
+///
+/// Runs `func(item, context)` for every item across the scheduler's workers and
+/// blocks until all of them have finished. The scheduler must be started before
+/// this is called (an un-started scheduler rejects the submit and this returns
+/// `Error.SchedulerShutdown` without waiting). The per-item task contexts live
+/// in a single allocation owned by this call; it waits for every submitted task
+/// to complete before freeing that allocation, so a worker never dereferences
+/// freed memory.
 pub fn parallelForEach(
     scheduler: *Scheduler,
     comptime T: type,
@@ -395,22 +497,53 @@ pub fn parallelForEach(
     context: anytype,
     comptime func: fn (item: T, ctx: @TypeOf(context)) void,
 ) !void {
+    if (items.len == 0) return;
+
     const Context = struct {
         item: T,
         user_ctx: @TypeOf(context),
+        remaining: *std.atomic.Value(usize),
 
         fn execute(self_ptr: ?*anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(self_ptr.?));
             func(self.item, self.user_ctx);
+            // Signal completion last: the waiter frees `contexts` once this
+            // reaches zero, so no field may be touched after this store.
+            _ = self.remaining.fetchSub(1, .acq_rel);
         }
     };
 
+    var remaining = std.atomic.Value(usize).init(items.len);
     var contexts = try scheduler.allocator.alloc(Context, items.len);
     defer scheduler.allocator.free(contexts);
 
+    var submitted: usize = 0;
+    // Whether we exit normally or via a submit error, wait until every task
+    // that was actually submitted has finished before the deferred free runs;
+    // otherwise a still-running worker would read the freed `contexts`. Only
+    // submitted slots ever decrement `remaining`, so it settles at
+    // `items.len - submitted`.
+    errdefer while (remaining.load(.acquire) != items.len - submitted) {
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    };
+
     for (items, 0..) |item, i| {
-        contexts[i] = Context{ .item = item, .user_ctx = context };
-        try scheduler.submit(Context.execute, &contexts[i]);
+        contexts[i] = Context{ .item = item, .user_ctx = context, .remaining = &remaining };
+        while (true) {
+            scheduler.submit(Context.execute, &contexts[i]) catch |err| switch (err) {
+                Error.QueueFull => {
+                    std.atomic.spinLoopHint();
+                    continue;
+                },
+                else => return err,
+            };
+            break;
+        }
+        submitted += 1;
+    }
+
+    while (remaining.load(.acquire) != 0) {
+        std.Thread.yield() catch std.atomic.spinLoopHint();
     }
 }
 
@@ -445,6 +578,8 @@ pub fn Future(comptime T: type) type {
 
         pub fn wait(self: *Self) !T {
             while (!self.isComplete()) {
+                // Spin-wait scheduling hint; a declined yield just tightens the
+                // spin for one iteration and is safely ignorable.
                 std.Thread.yield() catch {};
             }
             if (self.err) |err| return err;
@@ -493,4 +628,263 @@ test "scheduler creation" {
     defer scheduler.deinit();
 
     try std.testing.expectEqual(@as(usize, 2), scheduler.num_workers);
+}
+
+test "work stealing deque reports QueueFull at capacity and recovers after drain" {
+    const allocator = std.testing.allocator;
+
+    var deque = try WorkStealingDeque(u64).init(allocator);
+    defer deque.deinit();
+
+    const capacity = deque.buffer.len;
+
+    // Fill to exactly capacity — every push must succeed.
+    var i: u64 = 0;
+    while (i < capacity) : (i += 1) {
+        try deque.push(i);
+    }
+    try std.testing.expectEqual(capacity, deque.size());
+
+    // The next push has no room and must surface backpressure, not overwrite.
+    try std.testing.expectError(Error.QueueFull, deque.push(capacity));
+
+    // Draining one slot frees room for exactly one more push.
+    const first = deque.steal();
+    try std.testing.expect(first != null);
+    try deque.push(capacity);
+    try std.testing.expectError(Error.QueueFull, deque.push(capacity + 1));
+}
+
+test "work stealing deque consumes every item exactly once under concurrent stealers" {
+    const allocator = std.testing.allocator;
+
+    // Enough items to force many wrap-arounds and full/empty transitions of the
+    // 1024-slot buffer, so the push/steal interleaving is exercised heavily.
+    const total_items: u64 = 50_000;
+    const num_thieves = 4;
+
+    var deque = try WorkStealingDeque(u64).init(allocator);
+    defer deque.deinit();
+
+    const seen = try allocator.alloc(std.atomic.Value(u8), total_items);
+    defer allocator.free(seen);
+    for (seen) |*s| s.* = std.atomic.Value(u8).init(0);
+
+    const Shared = struct {
+        deque: *WorkStealingDeque(u64),
+        seen: []std.atomic.Value(u8),
+        consumed: std.atomic.Value(u64),
+        total: u64,
+
+        fn thief(self: *@This()) void {
+            while (self.consumed.load(.monotonic) < self.total) {
+                if (self.deque.steal()) |v| {
+                    // Record this value's consumption; a second consumer of the
+                    // same value would push the counter past 1 and fail the test.
+                    _ = self.seen[@intCast(v)].fetchAdd(1, .monotonic);
+                    _ = self.consumed.fetchAdd(1, .monotonic);
+                } else {
+                    std.atomic.spinLoopHint();
+                }
+            }
+        }
+    };
+
+    var shared = Shared{
+        .deque = &deque,
+        .seen = seen,
+        .consumed = std.atomic.Value(u64).init(0),
+        .total = total_items,
+    };
+
+    var thieves: [num_thieves]std.Thread = undefined;
+    var spawned: usize = 0;
+    errdefer for (thieves[0..spawned]) |t| t.join();
+    while (spawned < num_thieves) : (spawned += 1) {
+        thieves[spawned] = try std.Thread.spawn(.{}, Shared.thief, .{&shared});
+    }
+
+    // Owner produces every item, spinning while the buffer is full so the
+    // thieves get a chance to drain it (bounded backpressure, never a drop).
+    var produced: u64 = 0;
+    while (produced < total_items) {
+        deque.push(produced) catch |err| switch (err) {
+            Error.QueueFull => {
+                std.atomic.spinLoopHint();
+                continue;
+            },
+            else => return err,
+        };
+        produced += 1;
+    }
+
+    for (thieves) |t| t.join();
+    spawned = 0;
+
+    // Every value must have been consumed exactly once — no loss, no dup.
+    try std.testing.expectEqual(total_items, shared.consumed.load(.monotonic));
+    for (seen) |*s| {
+        try std.testing.expectEqual(@as(u8, 1), s.load(.monotonic));
+    }
+    try std.testing.expect(deque.isEmpty());
+}
+
+test "work stealing deque resolves single-element pop/steal race to one winner" {
+    const allocator = std.testing.allocator;
+
+    // Each round places exactly one element, then owner-pop and thief-steal
+    // contend for it. Exactly one side must win every round; the last-element
+    // cmpxchg in pop()/steal() is what makes that safe.
+    const rounds: usize = 50_000;
+
+    var deque = try WorkStealingDeque(u64).init(allocator);
+    defer deque.deinit();
+
+    const Shared = struct {
+        deque: *WorkStealingDeque(u64),
+        rounds: usize,
+        // Round r is announced by storing r+1 so 0 means "no round yet".
+        round_ready: std.atomic.Value(usize),
+        thief_done: std.atomic.Value(usize),
+        thief_got: std.atomic.Value(u8),
+        thief_wins: std.atomic.Value(usize),
+
+        fn thief(self: *@This()) void {
+            var r: usize = 0;
+            while (r < self.rounds) : (r += 1) {
+                // Wait for the owner to publish this round's element.
+                while (self.round_ready.load(.acquire) != r + 1) {
+                    std.atomic.spinLoopHint();
+                }
+                const got: u8 = if (self.deque.steal() != null) 1 else 0;
+                if (got == 1) _ = self.thief_wins.fetchAdd(1, .monotonic);
+                // Publish the per-round result before the done marker so the
+                // owner's acquire-load of thief_done sees a settled thief_got.
+                self.thief_got.store(got, .monotonic);
+                self.thief_done.store(r + 1, .release);
+            }
+        }
+    };
+
+    var shared = Shared{
+        .deque = &deque,
+        .rounds = rounds,
+        .round_ready = std.atomic.Value(usize).init(0),
+        .thief_done = std.atomic.Value(usize).init(0),
+        .thief_got = std.atomic.Value(u8).init(0),
+        .thief_wins = std.atomic.Value(usize).init(0),
+    };
+
+    var thief_thread = try std.Thread.spawn(.{}, Shared.thief, .{&shared});
+    defer thief_thread.join();
+
+    var owner_wins: usize = 0;
+    var r: usize = 0;
+    while (r < rounds) : (r += 1) {
+        try deque.push(@as(u64, r));
+        // Announce the round, then immediately contend with the thief.
+        shared.round_ready.store(r + 1, .release);
+        const owner_got: u8 = if (deque.pop() != null) 1 else 0;
+        owner_wins += owner_got;
+
+        // Rendezvous: wait for the thief to finish its single steal attempt.
+        while (shared.thief_done.load(.acquire) != r + 1) {
+            std.atomic.spinLoopHint();
+        }
+        const thief_got = shared.thief_got.load(.monotonic);
+
+        // The element existed and cannot be consumed twice nor vanish.
+        try std.testing.expectEqual(@as(u8, 1), owner_got + thief_got);
+        // The deque must be empty again before the next round pushes.
+        try std.testing.expect(deque.isEmpty());
+    }
+
+    // Cross-check: every round had exactly one winner, split across the sides.
+    try std.testing.expectEqual(rounds, owner_wins + shared.thief_wins.load(.monotonic));
+}
+
+test "scheduler starts, runs submitted work, and joins all workers on shutdown" {
+    const allocator = std.testing.allocator;
+
+    const scheduler = try Scheduler.init(allocator, 4);
+    defer scheduler.deinit();
+
+    const Counter = struct {
+        value: std.atomic.Value(u64),
+        fn bump(context: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            _ = self.value.fetchAdd(1, .monotonic);
+        }
+    };
+    var counter = Counter{ .value = std.atomic.Value(u64).init(0) };
+
+    try scheduler.start();
+
+    const total: u64 = 2000;
+    var submitted: u64 = 0;
+    while (submitted < total) : (submitted += 1) {
+        // Retry on transient backpressure so every task is actually enqueued.
+        while (true) {
+            scheduler.submit(Counter.bump, &counter) catch |err| switch (err) {
+                Error.QueueFull => {
+                    std.atomic.spinLoopHint();
+                    continue;
+                },
+                else => return err,
+            };
+            break;
+        }
+    }
+
+    // Wait until every submitted task has run, so shutdown is exercised on a
+    // drained scheduler rather than racing the workers. A bounded spin keeps the
+    // test from hanging if a task were dropped (it would fail via the count).
+    var spins: usize = 0;
+    while (counter.value.load(.monotonic) < total and spins < 100_000_000) : (spins += 1) {
+        std.atomic.spinLoopHint();
+    }
+
+    try std.testing.expectEqual(total, counter.value.load(.monotonic));
+
+    // shutdown() must join all worker threads and leave the scheduler stopped;
+    // if any thread failed to join this call would hang the test.
+    scheduler.shutdown();
+    try std.testing.expect(!scheduler.is_running.load(.acquire));
+    for (scheduler.workers) |*worker| {
+        try std.testing.expect(worker.thread == null);
+    }
+
+    // Submitting after shutdown is rejected, not silently dropped.
+    try std.testing.expectError(Error.SchedulerShutdown, scheduler.submit(Counter.bump, &counter));
+}
+
+test "parallelForEach runs every item once and waits before freeing contexts" {
+    const allocator = std.testing.allocator;
+
+    const scheduler = try Scheduler.init(allocator, 4);
+    defer scheduler.deinit();
+    try scheduler.start();
+
+    const n = 1000;
+    const results = try allocator.alloc(std.atomic.Value(u32), n);
+    defer allocator.free(results);
+    for (results) |*r| r.* = std.atomic.Value(u32).init(0);
+
+    const items = try allocator.alloc(usize, n);
+    defer allocator.free(items);
+    for (items, 0..) |*it, i| it.* = i;
+
+    const Ops = struct {
+        fn mark(item: usize, ctx: []std.atomic.Value(u32)) void {
+            _ = ctx[item].fetchAdd(1, .monotonic);
+        }
+    };
+
+    // Returns only after every task has completed; if it freed contexts early a
+    // worker would fault or the counts would be wrong.
+    try parallelForEach(scheduler, usize, items, results, Ops.mark);
+
+    for (results) |*r| {
+        try std.testing.expectEqual(@as(u32, 1), r.load(.monotonic));
+    }
 }

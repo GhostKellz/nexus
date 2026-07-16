@@ -3,7 +3,6 @@ const net = @import("../net/tcp.zig");
 
 /// PostgreSQL wire protocol implementation
 /// Implements the PostgreSQL Frontend/Backend Protocol
-
 pub const Error = error{
     ConnectionFailed,
     AuthenticationFailed,
@@ -123,6 +122,16 @@ const MessageType = enum(u8) {
     _,
 };
 
+/// Validate a backend message's self-reported length before it is used to slice
+/// the read buffer. `msg_len` is the on-wire length that includes its own 4
+/// length bytes but not the leading type byte, so anything below 4 is
+/// malformed, and anything that would not fit in `capacity` (type byte plus
+/// payload) is rejected so downstream slicing and `1 + msg_len` framing math
+/// stay in bounds.
+fn checkMessageLen(msg_len: u32, capacity: usize) Error!void {
+    if (msg_len < 4 or msg_len > capacity - 1) return Error.InvalidResponse;
+}
+
 pub const Connection = struct {
     client: net.TcpClient,
     config: ConnectionConfig,
@@ -140,6 +149,9 @@ pub const Connection = struct {
 
     pub fn deinit(self: *Connection) void {
         if (self.connected) {
+            // Best-effort Terminate message during teardown. A failed write means
+            // the peer/socket is already gone; the fd is closed unconditionally by
+            // client.deinit() below, so the error is safely ignorable here.
             self.close() catch {};
         }
         self.client.deinit();
@@ -420,6 +432,13 @@ pub const Connection = struct {
 
             const msg_type: MessageType = @enumFromInt(buf[buf_pos]);
             const msg_len = std.mem.readInt(u32, buf[buf_pos + 1 ..][0..4], .big);
+            // A backend message length counts itself (the 4 length bytes) but not
+            // the leading type byte, so it must be >= 4. It also must fit in the
+            // read buffer alongside that type byte; rejecting anything larger
+            // prevents the `buf_pos + 5 .. buf_pos + 1 + msg_len` slice below from
+            // panicking (start > end when msg_len < 4) or the framing loop's
+            // `1 + msg_len` from overflowing u32 on a hostile length.
+            try checkMessageLen(msg_len, buf.len);
 
             // Ensure we have the full message
             while (buf_len - buf_pos < 1 + msg_len) {
@@ -614,4 +633,21 @@ test "postgres connection init" {
     defer conn.deinit();
 
     try std.testing.expect(!conn.connected);
+}
+
+test "postgres backend message length is validated" {
+    const capacity: usize = 65536;
+
+    // Lengths below 4 would make the payload slice start past its end, and a
+    // length that does not fit the buffer would overflow the framing math.
+    try std.testing.expectError(Error.InvalidResponse, checkMessageLen(0, capacity));
+    try std.testing.expectError(Error.InvalidResponse, checkMessageLen(3, capacity));
+    try std.testing.expectError(Error.InvalidResponse, checkMessageLen(0xFFFFFFFF, capacity));
+    try std.testing.expectError(Error.InvalidResponse, checkMessageLen(capacity, capacity));
+
+    // The smallest legal message (length-only, empty payload) and a typical
+    // one both fit and must be accepted.
+    try checkMessageLen(4, capacity);
+    try checkMessageLen(100, capacity);
+    try checkMessageLen(@intCast(capacity - 1), capacity);
 }

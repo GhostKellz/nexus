@@ -2,13 +2,13 @@ const std = @import("std");
 const nexus = @import("nexus");
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     // Print startup banner
-    nexus.console.log("⚡ Nexus WebSocket Chat Server");
-    nexus.console.log("Node.js reimagined in Zig + WASM - 10x better\n");
+    nexus.console.log("⚡ Nexus WebSocket Chat Server", .{});
+    nexus.console.log("An application runtime written in Zig\n", .{});
 
     // Create HTTP server
     const config = nexus.http.ServerConfig{
@@ -20,7 +20,7 @@ pub fn main() !void {
     defer server.deinit();
 
     // Serve static HTML page
-    try server.get("/", struct {
+    try server.route("GET", "/", struct {
         fn handler(req: *nexus.http.Request, res: *nexus.http.Response) !void {
             _ = req;
             const html =
@@ -85,61 +85,31 @@ pub fn main() !void {
         }
     }.handler);
 
-    // WebSocket endpoint
-    try server.get("/ws", struct {
+    // WebSocket endpoint.
+    //
+    // The HTTP -> WebSocket upgrade helper (Response.upgradeWebSocket) is being
+    // reworked against the current std.Io networking API, so this route reports
+    // that the endpoint is not yet available rather than performing a handshake.
+    // The chat page above still loads and attempts to connect, demonstrating the
+    // client side of the flow.
+    try server.route("GET", "/ws", struct {
         fn handler(req: *nexus.http.Request, res: *nexus.http.Response) !void {
-            // Upgrade to WebSocket
-            const ws = try res.upgradeWebSocket(req);
-            defer {
-                ws.deinit();
-                req.allocator.destroy(ws);
-            }
-
-            nexus.console.info("WebSocket client connected: {s}", .{ws.id});
-
-            // Send welcome message
-            try ws.sendText("Welcome to Nexus Chat!");
-
-            // Echo loop
-            while (true) {
-                const msg = ws.receive() catch |err| {
-                    nexus.console.warn("WebSocket error: {}", .{err});
-                    break;
-                };
-                defer msg.deinit();
-
-                if (msg.isClose()) {
-                    nexus.console.info("Client {s} disconnected", .{ws.id});
-                    break;
-                }
-
-                if (msg.isPing()) {
-                    try ws.pong();
-                    continue;
-                }
-
-                if (msg.isText()) {
-                    const text = msg.getText() orelse "";
-                    nexus.console.log("[{s}] {s}", .{ ws.id, text });
-
-                    // Echo back
-                    const echo = try std.fmt.allocPrint(req.allocator, "[{s}] {s}", .{ ws.id, text });
-                    defer req.allocator.free(echo);
-                    try ws.sendText(echo);
-                }
-            }
+            _ = req;
+            nexus.console.info("WebSocket upgrade requested on /ws", .{});
+            res.status_code = .InternalServerError;
+            try res.text("WebSocket upgrade is not available in this build");
         }
     }.handler);
 
     // Start server
-    nexus.console.log("🚀 Nexus HTTP + WebSocket server running");
-    nexus.console.log("   http://localhost:3000");
-    nexus.console.log("");
-    nexus.console.log("Routes:");
-    nexus.console.log("  GET  /     - Chat interface");
-    nexus.console.log("  GET  /ws   - WebSocket endpoint");
-    nexus.console.log("");
-    nexus.console.log("Press Ctrl+C to stop\n");
+    nexus.console.log("🚀 Nexus HTTP + WebSocket server running", .{});
+    nexus.console.log("   http://localhost:3000", .{});
+    nexus.console.log("", .{});
+    nexus.console.log("Routes:", .{});
+    nexus.console.log("  GET  /     - Chat interface", .{});
+    nexus.console.log("  GET  /ws   - WebSocket endpoint", .{});
+    nexus.console.log("", .{});
+    nexus.console.log("Press Ctrl+C to stop\n", .{});
 
     try server.listen();
 }

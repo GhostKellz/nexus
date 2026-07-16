@@ -1,179 +1,268 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
-// Although this function looks imperative, it does not perform the build
-// directly and instead it mutates the build graph (`b`) that will be then
-// executed by an external runner. The functions in `std.Build` implement a DSL
-// for defining build steps and express dependencies between them, allowing the
-// build runner to parallelize the build automatically (and the cache system to
-// know when a step doesn't need to be re-run).
+// Nexus follows the still-evolving `std.Io` API and therefore pins one exact Zig
+// development build. Enforce it while the build graph is constructed so a
+// mismatched toolchain fails immediately with an actionable message instead of a
+// wall of downstream std-library compile errors. The pinned revision lives in
+// build.zig.zon (single source of truth); SemanticVersion ordering ignores only
+// the trailing "+<commit>" build metadata, so the `dev.<N>` counter is the pin.
+comptime {
+    const pinned = std.SemanticVersion.parse(@import("build.zig.zon").minimum_zig_version) catch
+        @compileError("build.zig.zon has an unparseable minimum_zig_version");
+    if (builtin.zig_version.order(pinned) != .eq) {
+        @compileError(
+            "Nexus requires the exact pinned Zig toolchain " ++
+                @import("build.zig.zon").minimum_zig_version ++
+                " declared in build.zig.zon. Run `zig version`, then install the matching build (https://ziglang.org/download/); other Zig versions are not supported.",
+        );
+    }
+}
+
+// `build` mutates the build graph (`b`); the external runner executes it.
 pub fn build(b: *std.Build) void {
-    // Standard target options allow the person running `zig build` to choose
-    // what target to build for. Here we do not override the defaults, which
-    // means any target is allowed, and the default is native. Other options
-    // for restricting supported target set are available.
+    // Native by default; caller may cross-compile and pick the optimize mode.
     const target = b.standardTargetOptions(.{});
-    // Standard optimization options allow the person running `zig build` to select
-    // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
-    // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
-    // It's also possible to define more custom flags to toggle optional features
-    // of this build script using `b.option()`. All defined flags (including
-    // target and optimize options) will be listed when running `zig build --help`
-    // in this directory.
 
-    // This creates a module, which represents a collection of source files alongside
-    // some compilation options, such as optimization mode and linked system libraries.
-    // Zig modules are the preferred way of making Zig code available to consumers.
-    // addModule defines a module that we intend to make available for importing
-    // to our consumers. We must give it a name because a Zig package can expose
-    // multiple modules and consumers will need to be able to specify which
-    // module they want to access.
+    // Experimental, UNVERIFIED custom TLS transport. The bundled TLS stack does
+    // not implement peer/certificate verification, transcript verification, the
+    // key schedule, or AEAD record protection, so it is inaccessible by default
+    // and is never presented as a secure channel. Opt in explicitly to exercise
+    // it; production paths must not rely on it in v0.1.2.
+    const tls_experimental = b.option(
+        bool,
+        "tls-experimental",
+        "Enable the experimental, UNVERIFIED custom TLS transport (insecure; off by default)",
+    ) orelse false;
+
+    // Single source of truth for the release version and supported toolchain:
+    // the package manifest. Every binary, `--version` string, generated project,
+    // and package metadata field derives from these so they cannot drift apart.
+    const manifest = @import("build.zig.zon");
+
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "tls_experimental", tls_experimental);
+    build_options.addOption([]const u8, "version", manifest.version);
+    build_options.addOption([]const u8, "min_zig_version", manifest.minimum_zig_version);
+    const options_module = build_options.createModule();
+
+    // The public library module consumers import as `nexus`. Its public surface
+    // is whatever `src/root.zig` re-exports.
     const mod = b.addModule("nexus", .{
-        // The root source file is the "entry point" of this module. Users of
-        // this module will only be able to access public declarations contained
-        // in this file, which means that if you have declarations that you
-        // intend to expose to consumers that were defined in other files part
-        // of this module, you will have to make sure to re-export them from
-        // the root file.
         .root_source_file = b.path("src/root.zig"),
-        // Later on we'll use this module as the root module of a test executable
-        // which requires us to specify a target.
         .target = target,
     });
 
-    // Here we define an executable. An executable needs to have a root module
-    // which needs to expose a `main` function. While we could add a main function
-    // to the module defined above, it's sometimes preferable to split business
-    // logic and the CLI into two separate modules.
-    //
-    // If your goal is to create a Zig library for others to use, consider if
-    // it might benefit from also exposing a CLI tool. A parser library for a
-    // data serialization format could also bundle a CLI syntax checker, for example.
-    //
-    // If instead your goal is to create an executable, consider if users might
-    // be interested in also being able to embed the core functionality of your
-    // program in their own executable in order to avoid the overhead involved in
-    // subprocessing your CLI tool.
-    //
-    // If neither case applies to you, feel free to delete the declaration you
-    // don't need and to put everything under a single module.
+    // Expose compile-time build options (e.g. the experimental-TLS gate) to the
+    // library sources. Every executable, test, example, and benchmark imports
+    // `nexus`, so wiring the options module here reaches all of them.
+    mod.addImport("build_options", options_module);
+
+    // Project scaffolding used by `nexus init`. Kept as its own module so the
+    // CLI and the generated-project contract test share one generator.
+    const scaffold_mod = b.createModule(.{
+        .root_source_file = b.path("src/scaffold.zig"),
+        .target = target,
+    });
+    scaffold_mod.addImport("build_options", options_module);
+
+    // The `nexus` CLI — the one binary installed by the default `zig build` and
+    // the only supported/shipped executable in v0.1.2.
     const exe = b.addExecutable(.{
         .name = "nexus",
         .root_module = b.createModule(.{
-            // b.createModule defines a new module just like b.addModule but,
-            // unlike b.addModule, it does not expose the module to consumers of
-            // this package, which is why in this case we don't have to give it a name.
             .root_source_file = b.path("src/main.zig"),
-            // Target and optimization levels must be explicitly wired in when
-            // defining an executable or library (in the root module), and you
-            // can also hardcode a specific target for an executable or library
-            // definition if desireable (e.g. firmware for embedded devices).
             .target = target,
             .optimize = optimize,
-            // List of modules available for import in source files part of the
-            // root module.
             .imports = &.{
-                // Here "nexus" is the name you will use in your source code to
-                // import this module (e.g. `@import("nexus")`). The name is
-                // repeated because you are allowed to rename your imports, which
-                // can be extremely useful in case of collisions (which can happen
-                // importing modules from different packages).
                 .{ .name = "nexus", .module = mod },
+                // The project generator behind `nexus init`; shared with the
+                // generated-project contract test so both emit identical files.
+                .{ .name = "scaffold", .module = scaffold_mod },
             },
         }),
     });
 
-    // This declares intent for the executable to be installed into the
-    // install prefix when running `zig build` (i.e. when executing the default
-    // step). By default the install prefix is `zig-out/` but can be overridden
-    // by passing `--prefix` or `-p`.
+    // Install the CLI into the prefix (default `zig-out/`) on the default step.
     b.installArtifact(exe);
 
-    // Add ZigScript runtime executable
-    const zs_exe = b.addExecutable(.{
-        .name = "nexus-zs",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/zigscript/cli.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "nexus", .module = mod },
-            },
-        }),
-    });
-    b.installArtifact(zs_exe);
-
-    // Add ZigScript run step
-    const zs_step = b.step("zs", "Run ZigScript runtime");
-    const run_zs = b.addRunArtifact(zs_exe);
-    zs_step.dependOn(&run_zs.step);
-    run_zs.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_zs.addArgs(args);
-    }
-
-    // This creates a top level step. Top level steps have a name and can be
-    // invoked by name when running `zig build` (e.g. `zig build run`).
-    // This will evaluate the `run` step rather than the default step.
-    // For a top level step to actually do something, it must depend on other
-    // steps (e.g. a Run step, as we will see in a moment).
+    // `zig build run [-- args]` builds, installs, and runs the CLI.
     const run_step = b.step("run", "Run the app");
-
-    // This creates a RunArtifact step in the build graph. A RunArtifact step
-    // invokes an executable compiled by Zig. Steps will only be executed by the
-    // runner if invoked directly by the user (in the case of top level steps)
-    // or if another step depends on it, so it's up to you to define when and
-    // how this Run step will be executed. In our case we want to run it when
-    // the user runs `zig build run`, so we create a dependency link.
     const run_cmd = b.addRunArtifact(exe);
     run_step.dependOn(&run_cmd.step);
-
-    // By making the run step depend on the default step, it will be run from the
-    // installation directory rather than directly from within the cache directory.
+    // Run from the install dir, not straight out of the cache.
     run_cmd.step.dependOn(b.getInstallStep());
+    run_cmd.addPassthruArgs();
 
-    // This allows the user to pass arguments to the application in the build
-    // command itself, like this: `zig build run -- arg1 arg2 etc`
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
-
-    // Creates an executable that will run `test` blocks from the provided module.
-    // Here `mod` needs to define a target, which is why earlier we made sure to
-    // set the releative field.
+    // Each test binary covers exactly one module, so the library root and the
+    // CLI's own root need separate test executables.
     const mod_tests = b.addTest(.{
         .root_module = mod,
     });
-
-    // A run step that will run the test executable.
     const run_mod_tests = b.addRunArtifact(mod_tests);
 
-    // Creates an executable that will run `test` blocks from the executable's
-    // root module. Note that test executables only test one module at a time,
-    // hence why we have to create two separate ones.
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
     });
-
-    // A run step that will run the second test executable.
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
-    // A top level step for running all tests. dependOn can be called multiple
-    // times and since the two run steps do not depend on one another, this will
-    // make the two of them run in parallel.
+    // `test` runs the in-process unit roots in parallel (independent run steps).
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 
-    // Just like flags, top level steps are also listed in the `--help` menu.
-    //
-    // The Zig build system is entirely implemented in userland, which means
-    // that it cannot hook into private compiler APIs. All compilation work
-    // orchestrated by the build system will result in other Zig compiler
-    // subcommands being invoked with the right flags defined. You can observe
-    // these invocations when one fails (or you pass a flag to increase
-    // verbosity) to validate assumptions and diagnose problems.
-    //
-    // Lastly, the Zig build system is relatively simple and self-contained,
-    // and reading its source code will allow you to master it.
+    // A fast, single-root step for the normal edit/test loop: just the library
+    // unit tests (`src/root.zig`), which are the bulk of the suite. One compiler
+    // process = bounded memory and a quick turnaround, so it is safe to run on
+    // every change. The aggregate `test`/`test-all` steps compile several test
+    // roots at once and are meant for pre-push / release verification.
+    const test_lib_step = b.step("test-lib", "Run only the library unit tests (fast dev loop)");
+    test_lib_step.dependOn(&run_mod_tests.step);
+
+    // Integration tests exercise internal subsystems. Every source file may
+    // only belong to one module, and `nexus` already pulls in this tree, so the
+    // tests reach all internal types through the public `nexus` module.
+    const integration_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/integration_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "nexus", .module = mod },
+            },
+        }),
+    });
+    const run_integration_tests = b.addRunArtifact(integration_tests);
+    test_step.dependOn(&run_integration_tests.step);
+
+    // Generated-project contract test: runs the `nexus init` generator into a
+    // temp dir, compiles the emitted project with a child `zig build` against
+    // this checkout, launches it on an ephemeral port, and performs one request.
+    // Kept as its own step (not part of `test`) because it drives a full child
+    // build and needs child-process + socket access. The child build needs the
+    // absolute path of this very compiler, which is only known to the build
+    // graph — pass it through a dedicated options module.
+    const contract_options = b.addOptions();
+    contract_options.addOption([]const u8, "zig_exe", b.graph.zig_exe);
+    const init_contract = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/init_contract.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "nexus", .module = mod },
+                .{ .name = "scaffold", .module = scaffold_mod },
+                .{ .name = "contract_options", .module = contract_options.createModule() },
+            },
+        }),
+    });
+    const run_init_contract = b.addRunArtifact(init_contract);
+    const init_contract_step = b.step("init-contract", "Generate, build, and smoke-test a `nexus init` project");
+    init_contract_step.dependOn(&run_init_contract.step);
+
+    // CLI contract test: runs the built `nexus` binary with a matrix of
+    // arguments and asserts each command's exit status/output, pinning the
+    // fail-closed CLI surface (NX-008). Kept out of `test` because it drives the
+    // real executable as a subprocess. The binary path is injected through an
+    // options module via `addOptionPath`, which also makes the test depend on
+    // the compiled executable.
+    const cli_options = b.addOptions();
+    cli_options.addOptionPath("nexus_exe", exe.getEmittedBin());
+    const cli_contract = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/cli_contract.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "nexus", .module = mod },
+                .{ .name = "cli_options", .module = cli_options.createModule() },
+            },
+        }),
+    });
+    const run_cli_contract = b.addRunArtifact(cli_contract);
+    const cli_contract_step = b.step("cli-contract", "Run the CLI exit-status/output contract against the built nexus binary");
+    cli_contract_step.dependOn(&run_cli_contract.step);
+
+    // Group the socket/process integration contracts — the generated-project
+    // child build + live request, and the real-binary CLI matrix — under one
+    // name so the "integration" half of the suite has an explicit entry point
+    // distinct from the pure in-process unit tests.
+    const contracts_step = b.step("test-contracts", "Run the socket/process integration contracts (init + CLI)");
+    contracts_step.dependOn(&run_init_contract.step);
+    contracts_step.dependOn(&run_cli_contract.step);
+
+    // The complete release suite as a single command: every in-process unit test
+    // root plus both integration contracts. This compiles several test roots and
+    // the executable, so it is heavier than `test-lib`/`test` and is intended for
+    // pre-push / release verification rather than the inner dev loop.
+    const test_all_step = b.step("test-all", "Run the complete release suite (unit tests + integration contracts)");
+    test_all_step.dependOn(test_step);
+    test_all_step.dependOn(contracts_step);
+
+    // Compile every example against the public `nexus` module so the build
+    // graph fails loudly when an example drifts from the API. `zig build
+    // examples` builds them all; they are not installed by default.
+    const examples_step = b.step("examples", "Build all examples");
+    // database_demo is intentionally absent: the db drivers are gated out of the
+    // public surface and do not compile against the pinned toolchain (NX-011).
+    const example_names = [_][]const u8{
+        "hello-world",
+        "rest_api_todos",
+        "static_server",
+        "wasm_demo",
+        "websocket_chat",
+    };
+    for (example_names) |name| {
+        const example_exe = b.addExecutable(.{
+            .name = name,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(b.fmt("examples/{s}.zig", .{name})),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "nexus", .module = mod },
+                },
+            }),
+        });
+        const install_example = b.addInstallArtifact(example_exe, .{});
+        examples_step.dependOn(&install_example.step);
+    }
+
+    // Benchmarks compile against the public module too.
+    const bench_step = b.step("bench", "Build benchmarks");
+    const bench_exe = b.addExecutable(.{
+        .name = "http_throughput",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmarks/http_throughput.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "nexus", .module = mod },
+            },
+        }),
+    });
+    const install_bench = b.addInstallArtifact(bench_exe, .{});
+    bench_step.dependOn(&install_bench.step);
+
+    // Release step: build ONLY the supported, shipped v0.1.2 artifact — the
+    // `nexus` CLI — in ReleaseSafe. A network runtime keeps its safety checks in
+    // production, so ReleaseSafe (not ReleaseFast) is the release mode. The
+    // examples and benchmarks are deliberately outside the release surface and
+    // are not produced here.
+    const release_step = b.step("release", "Build the supported v0.1.2 release binary (nexus CLI, ReleaseSafe)");
+    const release_exe = b.addExecutable(.{
+        .name = "nexus",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = .ReleaseSafe,
+            .imports = &.{
+                .{ .name = "nexus", .module = mod },
+                .{ .name = "scaffold", .module = scaffold_mod },
+            },
+        }),
+    });
+    const install_release = b.addInstallArtifact(release_exe, .{});
+    release_step.dependOn(&install_release.step);
 }

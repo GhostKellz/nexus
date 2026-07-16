@@ -4,7 +4,6 @@ const wasi = @import("wasi.zig");
 
 /// Wasmer/Wasmtime integration for JIT compilation
 /// This module provides bindings to external WASM runtimes for production performance
-
 pub const RuntimeType = enum {
     wasmer,
     wasmtime,
@@ -115,41 +114,26 @@ pub const CompiledModule = struct {
     }
 
     fn compileJIT(self: *CompiledModule) !void {
-        // In real implementation, would invoke Wasmer/Wasmtime JIT compiler
-        // For now, store placeholder compiled code
-
-        std.debug.print("✓ JIT compiling WASM module ({d} bytes)...\n", .{self.wasm_bytes.len});
-
-        // Simulate compilation delay
-        std.time.sleep(std.time.ns_per_ms * 50);
-
-        // Store "compiled" code (in real impl, this would be native machine code)
+        // In real implementation, would invoke Wasmer/Wasmtime JIT compiler.
+        // For now, store placeholder compiled code (in real impl this would be
+        // native machine code).
         self.compiled_code = try self.allocator.dupe(u8, self.wasm_bytes);
-
-        std.debug.print("✓ JIT compilation complete\n", .{});
     }
 
     fn compileAOT(self: *CompiledModule) !void {
-        std.debug.print("✓ AOT compiling WASM module...\n", .{});
-
-        // Real implementation would invoke AOT compiler
-        // Generate native binary for target platform
-
+        // Real implementation would invoke an AOT compiler and generate a native
+        // binary for the target platform.
         self.compiled_code = try self.allocator.dupe(u8, self.wasm_bytes);
-
-        std.debug.print("✓ AOT compilation complete\n", .{});
     }
 
     /// Save compiled module to file
-    pub fn saveToFile(self: *CompiledModule, path: []const u8) !void {
+    pub fn saveToFile(self: *CompiledModule, io: std.Io, path: []const u8) !void {
         const compiled = self.compiled_code orelse return error.NotCompiled;
 
-        const file = try std.fs.cwd().createFile(path, .{});
-        defer file.close();
+        const file = try std.Io.Dir.cwd().createFile(io, path, .{});
+        defer file.close(io);
 
-        try file.writeAll(compiled);
-
-        std.debug.print("✓ Saved compiled module to: {s}\n", .{path});
+        try file.writeStreamingAll(io, compiled);
     }
 
     /// Instantiate module
@@ -163,8 +147,6 @@ pub const CompiledModule = struct {
         inst.memory = memory;
 
         self.instance = inst;
-
-        std.debug.print("✓ Module instantiated\n", .{});
 
         return inst;
     }
@@ -192,10 +174,11 @@ pub const ModuleCache = struct {
     cache_dir: []const u8,
     modules: std.StringHashMap(CompiledModule),
     allocator: std.mem.Allocator,
+    io: std.Io,
 
-    pub fn init(allocator: std.mem.Allocator, cache_dir: []const u8) !ModuleCache {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, cache_dir: []const u8) !ModuleCache {
         // Ensure cache directory exists
-        std.fs.cwd().makeDir(cache_dir) catch |err| {
+        std.Io.Dir.cwd().createDir(io, cache_dir, .default_dir) catch |err| {
             if (err != error.PathAlreadyExists) return err;
         };
 
@@ -203,6 +186,7 @@ pub const ModuleCache = struct {
             .cache_dir = try allocator.dupe(u8, cache_dir),
             .modules = std.StringHashMap(CompiledModule).init(allocator),
             .allocator = allocator,
+            .io = io,
         };
     }
 
@@ -220,12 +204,11 @@ pub const ModuleCache = struct {
     pub fn getOrCompile(self: *ModuleCache, module_path: []const u8, config: RuntimeConfig) !*CompiledModule {
         // Check cache first
         if (self.modules.getPtr(module_path)) |cached| {
-            std.debug.print("✓ Module loaded from cache: {s}\n", .{module_path});
             return cached;
         }
 
         // Load and compile module
-        const wasm_bytes = try std.fs.cwd().readFileAlloc(self.allocator, module_path, 10 * 1024 * 1024);
+        const wasm_bytes = try std.Io.Dir.cwd().readFileAlloc(self.io, module_path, self.allocator, .limited(10 * 1024 * 1024));
         defer self.allocator.free(wasm_bytes);
 
         var module = try CompiledModule.init(self.allocator, wasm_bytes, config);
@@ -238,7 +221,7 @@ pub const ModuleCache = struct {
         );
         defer self.allocator.free(cache_filename);
 
-        try module.saveToFile(cache_filename);
+        try module.saveToFile(self.io, cache_filename);
 
         // Store in memory cache
         const path_copy = try self.allocator.dupe(u8, module_path);
@@ -250,13 +233,13 @@ pub const ModuleCache = struct {
     /// Clear cache
     pub fn clear(self: *ModuleCache) !void {
         // Remove all cached files
-        var dir = try std.fs.cwd().openDir(self.cache_dir, .{ .iterate = true });
-        defer dir.close();
+        var dir = try std.Io.Dir.cwd().openDir(self.io, self.cache_dir, .{ .iterate = true });
+        defer dir.close(self.io);
 
         var it = dir.iterate();
-        while (try it.next()) |entry| {
+        while (try it.next(self.io)) |entry| {
             if (entry.kind == .file) {
-                try dir.deleteFile(entry.name);
+                try dir.deleteFile(self.io, entry.name);
             }
         }
 
@@ -266,8 +249,6 @@ pub const ModuleCache = struct {
             module.deinit();
         }
         self.modules.clearAndFree();
-
-        std.debug.print("✓ Module cache cleared\n", .{});
     }
 };
 
@@ -278,12 +259,12 @@ pub const Profiler = struct {
     instruction_count: u64 = 0,
     memory_used: usize = 0,
 
-    pub fn start(self: *Profiler) void {
-        self.start_time = std.time.milliTimestamp();
+    pub fn start(self: *Profiler, io: std.Io) void {
+        self.start_time = @intCast(@divFloor(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_ms));
     }
 
-    pub fn stop(self: *Profiler) void {
-        self.end_time = std.time.milliTimestamp();
+    pub fn stop(self: *Profiler, io: std.Io) void {
+        self.end_time = @intCast(@divFloor(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_ms));
     }
 
     pub fn getElapsedMs(self: *Profiler) i64 {
@@ -308,7 +289,7 @@ pub const Profiler = struct {
 
 /// Benchmark utilities
 pub const Benchmark = struct {
-    pub fn compareEngines(allocator: std.mem.Allocator, wasm_bytes: []const u8) !void {
+    pub fn compareEngines(allocator: std.mem.Allocator, io: std.Io, wasm_bytes: []const u8) !void {
         std.debug.print("\n=== Engine Comparison ===\n\n", .{});
 
         // Interpreter mode
@@ -317,12 +298,12 @@ pub const Benchmark = struct {
             config.compilation_mode = .interpreter;
 
             var profiler = Profiler{};
-            profiler.start();
+            profiler.start(io);
 
             var module = try CompiledModule.init(allocator, wasm_bytes, config);
             defer module.deinit();
 
-            profiler.stop();
+            profiler.stop(io);
 
             std.debug.print("Interpreter mode: {d}ms\n", .{profiler.getElapsedMs()});
         }
@@ -333,12 +314,12 @@ pub const Benchmark = struct {
             config.compilation_mode = .jit;
 
             var profiler = Profiler{};
-            profiler.start();
+            profiler.start(io);
 
             var module = try CompiledModule.init(allocator, wasm_bytes, config);
             defer module.deinit();
 
-            profiler.stop();
+            profiler.stop(io);
 
             std.debug.print("JIT mode: {d}ms\n", .{profiler.getElapsedMs()});
         }
@@ -349,12 +330,12 @@ pub const Benchmark = struct {
             config.compilation_mode = .aot;
 
             var profiler = Profiler{};
-            profiler.start();
+            profiler.start(io);
 
             var module = try CompiledModule.init(allocator, wasm_bytes, config);
             defer module.deinit();
 
-            profiler.stop();
+            profiler.stop(io);
 
             std.debug.print("AOT mode: {d}ms\n", .{profiler.getElapsedMs()});
         }
@@ -386,8 +367,16 @@ test "wasmer compilation modes" {
 
 test "module cache" {
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
 
-    var cache = try ModuleCache.init(allocator, "/tmp/nexus-wasm-cache-test");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_abs = tmp_buf[0..try tmp.dir.realPath(io, &tmp_buf)];
+    const cache_dir = try std.fs.path.join(allocator, &.{ tmp_abs, "cache" });
+    defer allocator.free(cache_dir);
+
+    var cache = try ModuleCache.init(allocator, io, cache_dir);
     defer cache.deinit();
 
     // Clear cache before test

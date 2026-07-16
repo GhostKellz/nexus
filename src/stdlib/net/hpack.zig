@@ -3,7 +3,6 @@ const huffman = @import("huffman.zig");
 
 /// HPACK - Header Compression for HTTP/2
 /// RFC 7541 - HPACK: Header Compression for HTTP/2
-
 pub const Error = error{
     InvalidIndex,
     IntegerOverflow,
@@ -15,6 +14,15 @@ pub const Error = error{
 pub const StaticEntry = struct {
     name: []const u8,
     value: []const u8,
+};
+
+/// A decoded header field. The name/value slices are heap-allocated and owned
+/// by the caller of `decodeHeaderBlock`. This is a named type (rather than an
+/// inline anonymous struct) so the function signature, its local accumulator,
+/// and callers all agree on a single type.
+pub const HeaderField = struct {
+    name: []u8,
+    value: []u8,
 };
 
 pub const STATIC_TABLE = [_]StaticEntry{
@@ -101,7 +109,7 @@ pub const DynamicTable = struct {
 
     pub fn init(allocator: std.mem.Allocator) DynamicTable {
         return DynamicTable{
-            .entries = std.ArrayList(DynamicEntry).init(allocator),
+            .entries = .empty,
             .allocator = allocator,
         };
     }
@@ -111,7 +119,7 @@ pub const DynamicTable = struct {
             self.allocator.free(entry.name);
             self.allocator.free(entry.value);
         }
-        self.entries.deinit();
+        self.entries.deinit(self.allocator);
     }
 
     pub fn setMaxSize(self: *DynamicTable, max_size: usize) !void {
@@ -137,7 +145,7 @@ pub const DynamicTable = struct {
         };
 
         // Add to front (most recent)
-        try self.entries.insert(0, entry);
+        try self.entries.insert(self.allocator, 0, entry);
         self.size += entry_size;
     }
 
@@ -149,7 +157,9 @@ pub const DynamicTable = struct {
     fn evictOldest(self: *DynamicTable) !void {
         if (self.entries.items.len == 0) return;
 
-        const entry = self.entries.pop();
+        // ArrayList.pop now returns an optional; the length check above
+        // guarantees a value here, but handle null defensively.
+        const entry = self.entries.pop() orelse return;
         self.size -= entry.size;
         self.allocator.free(entry.name);
         self.allocator.free(entry.value);
@@ -283,12 +293,18 @@ pub fn decodeInteger(data: []const u8, prefix_bits: u3, offset: *usize) !usize {
         const byte = data[offset.*];
         offset.* += 1;
 
-        value += (byte & 127) * multiplier;
-        multiplier *= 128;
+        // A hostile HPACK integer (a long run of continuation bytes) would
+        // otherwise overflow these usize multiplications/additions, which is a
+        // safety panic in checked builds. RFC 7541 §5.1 requires decoders to
+        // treat an over-large integer as an error, so fail closed instead.
+        const term = std.math.mul(usize, byte & 127, multiplier) catch return Error.IntegerOverflow;
+        value = std.math.add(usize, value, term) catch return Error.IntegerOverflow;
 
         if ((byte & 128) == 0) {
             return value;
         }
+
+        multiplier = std.math.mul(usize, multiplier, 128) catch return Error.IntegerOverflow;
     }
 
     return Error.IntegerOverflow;
@@ -356,7 +372,9 @@ pub fn decodeString(data: []const u8, offset: *usize, allocator: std.mem.Allocat
     const is_huffman = (data[offset.*] & 0x80) != 0;
     const length = try decodeInteger(data, 7, offset);
 
-    if (offset.* + length > data.len) return Error.StringTooLong;
+    // Compare against remaining bytes rather than computing offset.* + length,
+    // which could overflow usize for a hostile declared length.
+    if (length > data.len - offset.*) return Error.StringTooLong;
 
     const string_data = data[offset.* .. offset.* + length];
     offset.* += length;
@@ -469,9 +487,9 @@ pub fn decodeHeaderBlock(
     data: []const u8,
     context: *Context,
     allocator: std.mem.Allocator,
-) !std.ArrayList(struct { name: []u8, value: []u8 }) {
-    var headers = std.ArrayList(struct { name: []u8, value: []u8 }).init(allocator);
-    errdefer headers.deinit();
+) !std.ArrayList(HeaderField) {
+    var headers: std.ArrayList(HeaderField) = .empty;
+    errdefer headers.deinit(allocator);
 
     var offset: usize = 0;
 
@@ -482,7 +500,7 @@ pub fn decodeHeaderBlock(
             // Indexed header field
             const index = try decodeInteger(data, 7, &offset);
             const entry = try context.getEntry(index);
-            try headers.append(.{
+            try headers.append(allocator, .{
                 .name = try allocator.dupe(u8, entry.name),
                 .value = try allocator.dupe(u8, entry.value),
             });
@@ -502,7 +520,7 @@ pub fn decodeHeaderBlock(
             const value = try decodeString(data, &offset, allocator);
 
             try context.dynamic_table.add(name, value);
-            try headers.append(.{ .name = name, .value = value });
+            try headers.append(allocator, .{ .name = name, .value = value });
         } else {
             // Literal without indexing or never indexed
             offset += 1;
@@ -517,7 +535,7 @@ pub fn decodeHeaderBlock(
             }
 
             const value = try decodeString(data, &offset, allocator);
-            try headers.append(.{ .name = name, .value = value });
+            try headers.append(allocator, .{ .name = name, .value = value });
         }
     }
 
@@ -556,4 +574,41 @@ test "hpack dynamic table" {
     const entry = table.get(0).?;
     try std.testing.expectEqualStrings("custom-header", entry.name);
     try std.testing.expectEqualStrings("custom-value", entry.value);
+}
+
+test "hpack decodeInteger rejects overflowing continuation run" {
+    // Prefix byte is all-ones (max_prefix) followed by a long run of bytes
+    // with the continuation bit set. Without overflow-checked arithmetic this
+    // input drives multiplier *= 128 past usize and panics; it must instead
+    // fail closed with IntegerOverflow.
+    const data = [_]u8{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+    var offset: usize = 0;
+    try std.testing.expectError(Error.IntegerOverflow, decodeInteger(&data, 7, &offset));
+}
+
+test "hpack decodeInteger rejects truncated multibyte integer" {
+    // Prefix hits max and every remaining byte keeps the continuation bit set,
+    // so the integer never terminates before end-of-input.
+    const data = [_]u8{ 0x7F, 0x80, 0x80 };
+    var offset: usize = 0;
+    try std.testing.expectError(Error.IntegerOverflow, decodeInteger(&data, 7, &offset));
+}
+
+test "hpack decodeString rejects length past end of buffer" {
+    const allocator = std.testing.allocator;
+    // Literal (H=0) with declared length 10 but only 3 bytes of content.
+    const data = [_]u8{ 0x0A, 'a', 'b', 'c' };
+    var offset: usize = 0;
+    try std.testing.expectError(Error.StringTooLong, decodeString(&data, &offset, allocator));
+}
+
+test "hpack decodeHeaderBlock rejects out-of-range index" {
+    const allocator = std.testing.allocator;
+    var context = Context.init(allocator);
+    defer context.deinit();
+
+    // Indexed header field (0x80 bit) referencing index 127, which is far
+    // beyond the static table and an empty dynamic table.
+    const data = [_]u8{ 0xFF, 0x00 };
+    try std.testing.expectError(Error.InvalidIndex, decodeHeaderBlock(&data, &context, allocator));
 }

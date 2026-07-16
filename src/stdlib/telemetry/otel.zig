@@ -1,7 +1,17 @@
 const std = @import("std");
 
+const log = std.log.scoped(.otel);
+
 /// OpenTelemetry Distributed Tracing Implementation
 /// Specification: https://opentelemetry.io/docs/specs/otel/
+/// Wall-clock timestamp in milliseconds since the Unix epoch.
+///
+/// std.time.milliTimestamp was removed in favour of the IO-provided clock;
+/// read the wall clock through the global single-threaded provider.
+fn nowMillis() i64 {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    return std.Io.Clock.Timestamp.now(io, .real).raw.toMilliseconds();
+}
 
 pub const Error = error{
     TracerNotInitialized,
@@ -15,9 +25,10 @@ pub const Error = error{
 pub const TraceId = struct {
     bytes: [16]u8,
 
-    pub fn generate() TraceId {
+    pub fn generate() !TraceId {
         var id: TraceId = undefined;
-        std.crypto.random.bytes(&id.bytes);
+        const io = std.Io.Threaded.global_single_threaded.io();
+        try io.randomSecure(&id.bytes);
         return id;
     }
 
@@ -44,9 +55,10 @@ pub const TraceId = struct {
 pub const SpanId = struct {
     bytes: [8]u8,
 
-    pub fn generate() SpanId {
+    pub fn generate() !SpanId {
         var id: SpanId = undefined;
-        std.crypto.random.bytes(&id.bytes);
+        const io = std.Io.Threaded.global_single_threaded.io();
+        try io.randomSecure(&id.bytes);
         return id;
     }
 
@@ -205,59 +217,59 @@ pub const Span = struct {
     is_recording: bool = true,
     allocator: std.mem.Allocator,
 
-    pub fn init(allocator: std.mem.Allocator, name: []const u8, trace_id: TraceId) Span {
+    pub fn init(allocator: std.mem.Allocator, name: []const u8, trace_id: TraceId) !Span {
         return Span{
             .name = name,
             .trace_id = trace_id,
-            .span_id = SpanId.generate(),
-            .start_time = std.time.milliTimestamp(),
-            .attributes = std.ArrayList(Attribute).init(allocator),
-            .events = std.ArrayList(Event).init(allocator),
-            .links = std.ArrayList(Link).init(allocator),
+            .span_id = try SpanId.generate(),
+            .start_time = nowMillis(),
+            .attributes = .empty,
+            .events = .empty,
+            .links = .empty,
             .allocator = allocator,
         };
     }
 
     pub fn deinit(self: *Span) void {
-        self.attributes.deinit();
-        self.events.deinit();
-        self.links.deinit();
+        self.attributes.deinit(self.allocator);
+        self.events.deinit(self.allocator);
+        self.links.deinit(self.allocator);
     }
 
     /// End the span
     pub fn end(self: *Span) void {
         if (self.end_time == null) {
-            self.end_time = std.time.milliTimestamp();
+            self.end_time = nowMillis();
         }
     }
 
     /// Set span attribute
     pub fn setAttribute(self: *Span, key: []const u8, value: AttributeValue) !void {
         if (!self.is_recording) return;
-        try self.attributes.append(Attribute{ .key = key, .value = value });
+        try self.attributes.append(self.allocator, Attribute{ .key = key, .value = value });
     }
 
     /// Set multiple attributes
     pub fn setAttributes(self: *Span, attrs: []const Attribute) !void {
         if (!self.is_recording) return;
-        try self.attributes.appendSlice(attrs);
+        try self.attributes.appendSlice(self.allocator, attrs);
     }
 
     /// Add an event
     pub fn addEvent(self: *Span, name: []const u8) !void {
         if (!self.is_recording) return;
-        try self.events.append(Event{
+        try self.events.append(self.allocator, Event{
             .name = name,
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = nowMillis(),
         });
     }
 
     /// Add an event with attributes
     pub fn addEventWithAttributes(self: *Span, name: []const u8, attrs: []const Attribute) !void {
         if (!self.is_recording) return;
-        try self.events.append(Event{
+        try self.events.append(self.allocator, Event{
             .name = name,
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = nowMillis(),
             .attributes = attrs,
         });
     }
@@ -289,8 +301,8 @@ pub const Span = struct {
 
     /// Get duration in milliseconds
     pub fn getDuration(self: *const Span) ?i64 {
-        if (self.end_time) |end| {
-            return end - self.start_time;
+        if (self.end_time) |end_val| {
+            return end_val - self.start_time;
         }
         return null;
     }
@@ -471,22 +483,27 @@ pub const TracerProvider = struct {
     spans: std.ArrayList(*Span),
     allocator: std.mem.Allocator,
 
-    pub fn init(allocator: std.mem.Allocator) TracerProvider {
+    pub fn init(allocator: std.mem.Allocator) !TracerProvider {
         return TracerProvider{
-            .resource = Resource.init(allocator),
+            .resource = try Resource.init(allocator),
             .sampler = AlwaysOnSampler.getSampler(),
-            .spans = std.ArrayList(*Span).init(allocator),
+            .spans = .empty,
             .allocator = allocator,
         };
     }
 
     pub fn deinit(self: *TracerProvider) void {
-        self.flush() catch {};
+        // A final flush best-effort exports pending spans on shutdown. deinit
+        // cannot fail, so an export error is logged rather than propagated; the
+        // loop below still frees every span, so memory is reclaimed regardless.
+        self.flush() catch |err| {
+            log.warn("final span flush on deinit failed: {s}", .{@errorName(err)});
+        };
         for (self.spans.items) |span| {
             span.deinit();
             self.allocator.destroy(span);
         }
-        self.spans.deinit();
+        self.spans.deinit(self.allocator);
         self.resource.deinit();
     }
 
@@ -520,7 +537,7 @@ pub const TracerProvider = struct {
     }
 
     fn recordSpan(self: *TracerProvider, span: *Span) !void {
-        try self.spans.append(span);
+        try self.spans.append(self.allocator, span);
     }
 };
 
@@ -529,17 +546,18 @@ pub const Resource = struct {
     attributes: std.StringHashMap(AttributeValue),
     allocator: std.mem.Allocator,
 
-    pub fn init(allocator: std.mem.Allocator) Resource {
+    pub fn init(allocator: std.mem.Allocator) !Resource {
         var res = Resource{
             .attributes = std.StringHashMap(AttributeValue).init(allocator),
             .allocator = allocator,
         };
+        errdefer res.attributes.deinit();
 
         // Set default attributes
-        res.attributes.put("service.name", .{ .string = "unknown_service" }) catch {};
-        res.attributes.put("telemetry.sdk.name", .{ .string = "nexus-otel" }) catch {};
-        res.attributes.put("telemetry.sdk.language", .{ .string = "zig" }) catch {};
-        res.attributes.put("telemetry.sdk.version", .{ .string = "0.1.0" }) catch {};
+        try res.attributes.put("service.name", .{ .string = "unknown_service" });
+        try res.attributes.put("telemetry.sdk.name", .{ .string = "nexus-otel" });
+        try res.attributes.put("telemetry.sdk.language", .{ .string = "zig" });
+        try res.attributes.put("telemetry.sdk.version", .{ .string = @import("build_options").version });
 
         return res;
     }
@@ -561,26 +579,26 @@ pub const Tracer = struct {
 
     /// Start a new span
     pub fn startSpan(self: *Tracer, name: []const u8) !*Span {
-        const trace_id = TraceId.generate();
+        const trace_id = try TraceId.generate();
 
         // Check sampling
         if (!self.provider.sampler.shouldSample(trace_id, name)) {
             // Return a non-recording span
             const span = try self.provider.allocator.create(Span);
-            span.* = Span.init(self.provider.allocator, name, trace_id);
+            span.* = try Span.init(self.provider.allocator, name, trace_id);
             span.is_recording = false;
             return span;
         }
 
         const span = try self.provider.allocator.create(Span);
-        span.* = Span.init(self.provider.allocator, name, trace_id);
+        span.* = try Span.init(self.provider.allocator, name, trace_id);
         return span;
     }
 
     /// Start a span with parent context
     pub fn startSpanWithContext(self: *Tracer, name: []const u8, parent: TraceContext) !*Span {
         const span = try self.provider.allocator.create(Span);
-        span.* = Span.init(self.provider.allocator, name, parent.trace_id);
+        span.* = try Span.init(self.provider.allocator, name, parent.trace_id);
         span.parent_span_id = parent.span_id;
         return span;
     }
@@ -624,7 +642,7 @@ pub fn traceHttpRequest(
 
 // Tests
 test "trace id generation" {
-    const id = TraceId.generate();
+    const id = try TraceId.generate();
     try std.testing.expect(id.isValid());
 
     const hex = id.toHex();
@@ -642,8 +660,8 @@ test "trace context parsing" {
 
 test "trace context formatting" {
     var ctx = TraceContext{
-        .trace_id = TraceId.generate(),
-        .span_id = SpanId.generate(),
+        .trace_id = try TraceId.generate(),
+        .span_id = try SpanId.generate(),
         .trace_flags = 0x01,
     };
 
@@ -655,7 +673,7 @@ test "trace context formatting" {
 test "span creation" {
     const allocator = std.testing.allocator;
 
-    var provider = TracerProvider.init(allocator);
+    var provider = try TracerProvider.init(allocator);
     defer provider.deinit();
 
     var tracer = provider.getTracer("test-tracer");
@@ -663,4 +681,25 @@ test "span creation" {
     const span = try tracer.startSpan("test-operation");
     try span.setAttribute("key", .{ .string = "value" });
     try tracer.endSpan(span);
+}
+
+test "repeated tracer provider create/span/destroy cycles are leak-free" {
+    // Phase 2 exit gate: build a provider, emit an attributed span, and tear
+    // everything down many times. Confirms the default resource attributes, the
+    // span/attribute allocations, and the process-lifetime global io accessor
+    // leave nothing behind per cycle under the leak-detecting allocator.
+    const allocator = std.testing.allocator;
+
+    var cycle: usize = 0;
+    while (cycle < 256) : (cycle += 1) {
+        var provider = try TracerProvider.init(allocator);
+        defer provider.deinit();
+
+        var tracer = provider.getTracer("test-tracer");
+
+        const span = try tracer.startSpan("test-operation");
+        try span.setAttribute("key", .{ .string = "value" });
+        try span.setAttribute("count", .{ .int = @intCast(cycle) });
+        try tracer.endSpan(span);
+    }
 }

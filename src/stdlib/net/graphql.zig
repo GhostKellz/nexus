@@ -3,7 +3,6 @@ const http = @import("http.zig");
 
 /// Native GraphQL Server Implementation
 /// Specification: https://spec.graphql.org/
-
 pub const Error = error{
     ParseError,
     ValidationError,
@@ -14,6 +13,7 @@ pub const Error = error{
     VariableNotFound,
     InvalidArgument,
     NotNullViolation,
+    DepthLimitExceeded,
 };
 
 /// GraphQL value types
@@ -27,52 +27,53 @@ pub const Value = union(enum) {
     object: std.StringHashMap(Value),
 
     pub fn format(self: Value, allocator: std.mem.Allocator) ![]u8 {
-        var buf = std.ArrayList(u8).init(allocator);
-        try self.formatInto(&buf);
-        return buf.toOwnedSlice();
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(allocator);
+        try self.formatInto(allocator, &buf);
+        return buf.toOwnedSlice(allocator);
     }
 
-    fn formatInto(self: Value, buf: *std.ArrayList(u8)) !void {
+    fn formatInto(self: Value, allocator: std.mem.Allocator, buf: *std.ArrayList(u8)) !void {
         switch (self) {
-            .null => try buf.appendSlice("null"),
-            .int => |i| try buf.writer().print("{d}", .{i}),
-            .float => |f| try buf.writer().print("{d}", .{f}),
+            .null => try buf.appendSlice(allocator, "null"),
+            .int => |i| try buf.print(allocator, "{d}", .{i}),
+            .float => |f| try buf.print(allocator, "{d}", .{f}),
             .string => |s| {
-                try buf.append('"');
+                try buf.append(allocator, '"');
                 for (s) |c| {
                     switch (c) {
-                        '"' => try buf.appendSlice("\\\""),
-                        '\\' => try buf.appendSlice("\\\\"),
-                        '\n' => try buf.appendSlice("\\n"),
-                        '\r' => try buf.appendSlice("\\r"),
-                        '\t' => try buf.appendSlice("\\t"),
-                        else => try buf.append(c),
+                        '"' => try buf.appendSlice(allocator, "\\\""),
+                        '\\' => try buf.appendSlice(allocator, "\\\\"),
+                        '\n' => try buf.appendSlice(allocator, "\\n"),
+                        '\r' => try buf.appendSlice(allocator, "\\r"),
+                        '\t' => try buf.appendSlice(allocator, "\\t"),
+                        else => try buf.append(allocator, c),
                     }
                 }
-                try buf.append('"');
+                try buf.append(allocator, '"');
             },
-            .boolean => |b| try buf.appendSlice(if (b) "true" else "false"),
+            .boolean => |b| try buf.appendSlice(allocator, if (b) "true" else "false"),
             .list => |items| {
-                try buf.append('[');
+                try buf.append(allocator, '[');
                 for (items, 0..) |item, i| {
-                    if (i > 0) try buf.append(',');
-                    try item.formatInto(buf);
+                    if (i > 0) try buf.append(allocator, ',');
+                    try item.formatInto(allocator, buf);
                 }
-                try buf.append(']');
+                try buf.append(allocator, ']');
             },
             .object => |obj| {
-                try buf.append('{');
+                try buf.append(allocator, '{');
                 var iter = obj.iterator();
                 var first = true;
                 while (iter.next()) |entry| {
-                    if (!first) try buf.append(',');
+                    if (!first) try buf.append(allocator, ',');
                     first = false;
-                    try buf.append('"');
-                    try buf.appendSlice(entry.key_ptr.*);
-                    try buf.appendSlice("\":");
-                    try entry.value_ptr.formatInto(buf);
+                    try buf.append(allocator, '"');
+                    try buf.appendSlice(allocator, entry.key_ptr.*);
+                    try buf.appendSlice(allocator, "\":");
+                    try entry.value_ptr.formatInto(allocator, buf);
                 }
-                try buf.append('}');
+                try buf.append(allocator, '}');
             },
         }
     }
@@ -175,7 +176,7 @@ pub const Selection = struct {
         return Selection{
             .name = name,
             .arguments = std.StringHashMap(Value).init(allocator),
-            .selections = std.ArrayList(Selection).init(allocator),
+            .selections = .empty,
             .allocator = allocator,
         };
     }
@@ -185,7 +186,7 @@ pub const Selection = struct {
         for (self.selections.items) |*sel| {
             sel.deinit();
         }
-        self.selections.deinit();
+        self.selections.deinit(self.allocator);
     }
 };
 
@@ -200,7 +201,7 @@ pub const Operation = struct {
     pub fn init(allocator: std.mem.Allocator) Operation {
         return Operation{
             .variables = std.StringHashMap(Value).init(allocator),
-            .selections = std.ArrayList(Selection).init(allocator),
+            .selections = .empty,
             .allocator = allocator,
         };
     }
@@ -210,7 +211,7 @@ pub const Operation = struct {
         for (self.selections.items) |*sel| {
             sel.deinit();
         }
-        self.selections.deinit();
+        self.selections.deinit(self.allocator);
     }
 };
 
@@ -270,6 +271,13 @@ pub const Parser = struct {
     source: []const u8,
     pos: usize = 0,
     allocator: std.mem.Allocator,
+    depth: usize = 0,
+
+    /// Maximum nesting depth for selection sets and input values. A deeply
+    /// nested query ({{{{...}}}} or [[[[...]]]]) would otherwise recurse without
+    /// bound and overflow the stack — a classic GraphQL denial-of-service. The
+    /// limit is well beyond any legitimate query.
+    const max_depth = 64;
 
     pub fn init(allocator: std.mem.Allocator, source: []const u8) Parser {
         return Parser{
@@ -312,13 +320,19 @@ pub const Parser = struct {
         return op;
     }
 
-    fn parseSelectionSet(self: *Parser, selections: *std.ArrayList(Selection)) !void {
+    // Explicit error set breaks the inferred-error-set dependency loop with
+    // the mutually-recursive parseSelection.
+    fn parseSelectionSet(self: *Parser, selections: *std.ArrayList(Selection)) (Error || std.mem.Allocator.Error)!void {
+        if (self.depth >= max_depth) return Error.DepthLimitExceeded;
+        self.depth += 1;
+        defer self.depth -= 1;
+
         while (true) {
             self.skipWhitespace();
             if (self.peek() == '}' or self.isAtEnd()) break;
 
-            var sel = try self.parseSelection();
-            try selections.append(sel);
+            const sel = try self.parseSelection();
+            try selections.append(self.allocator, sel);
         }
 
         if (self.peek() == '}') {
@@ -331,6 +345,10 @@ pub const Parser = struct {
 
         const name = self.parseName() orelse return Error.ParseError;
         var sel = Selection.init(self.allocator, name);
+        // If argument or nested-selection parsing fails (e.g. the depth limit is
+        // hit), free the partially-built selection instead of leaking it. The
+        // caller only takes ownership once parseSelection returns successfully.
+        errdefer sel.deinit();
 
         self.skipWhitespace();
 
@@ -385,6 +403,10 @@ pub const Parser = struct {
     }
 
     fn parseValue(self: *Parser) !Value {
+        if (self.depth >= max_depth) return Error.DepthLimitExceeded;
+        self.depth += 1;
+        defer self.depth -= 1;
+
         self.skipWhitespace();
 
         const c = self.peek();
@@ -407,15 +429,15 @@ pub const Parser = struct {
         // List
         if (c == '[') {
             self.advance();
-            var items = std.ArrayList(Value).init(self.allocator);
+            var items: std.ArrayList(Value) = .empty;
             while (self.peek() != ']' and !self.isAtEnd()) {
                 const item = try self.parseValue();
-                try items.append(item);
+                try items.append(self.allocator, item);
                 self.skipWhitespace();
                 if (self.peek() == ',') self.advance();
             }
             if (self.peek() == ']') self.advance();
-            return Value{ .list = try items.toOwnedSlice() };
+            return Value{ .list = try items.toOwnedSlice(self.allocator) };
         }
 
         // Object/Input
@@ -689,12 +711,12 @@ pub const Handler = struct {
         const data_json = try result.format(self.allocator);
         defer self.allocator.free(data_json);
 
-        var response_buf = std.ArrayList(u8).init(self.allocator);
-        defer response_buf.deinit();
+        var response_buf: std.ArrayList(u8) = .empty;
+        defer response_buf.deinit(self.allocator);
 
-        try response_buf.appendSlice("{\"data\":");
-        try response_buf.appendSlice(data_json);
-        try response_buf.append('}');
+        try response_buf.appendSlice(self.allocator, "{\"data\":");
+        try response_buf.appendSlice(self.allocator, data_json);
+        try response_buf.append(self.allocator, '}');
 
         res.setHeader("Content-Type", "application/json");
         try res.text(response_buf.items);
@@ -764,6 +786,23 @@ test "parse query with arguments" {
 
     try std.testing.expectEqual(OperationType.query, op.operation_type);
     try std.testing.expectEqualStrings("GetUser", op.name.?);
+}
+
+test "graphql parser bounds selection-set nesting depth" {
+    const allocator = std.testing.allocator;
+
+    // Build a query nested far deeper than max_depth: { a { a { a { ...
+    // Unclosed is fine — the parser must hit the depth limit and fail closed
+    // (with all partially-built selections freed) before recursing off the
+    // stack.
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try buf.appendSlice(allocator, "{ ");
+    var i: usize = 0;
+    while (i < 300) : (i += 1) try buf.appendSlice(allocator, "a { ");
+
+    var parser = Parser.init(allocator, buf.items);
+    try std.testing.expectError(Error.DepthLimitExceeded, parser.parse());
 }
 
 test "value formatting" {

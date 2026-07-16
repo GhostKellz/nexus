@@ -9,12 +9,11 @@
 ///  - Range requests (resume downloads)
 ///  - Directory traversal protection
 ///  - Custom cache headers
-
 const std = @import("std");
 const nexus = @import("nexus");
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -42,33 +41,45 @@ pub fn main() !void {
     // Logging middleware
     try server.use(nexus.middleware.logger);
 
-    // Serve static files from ./public directory
-    const static_options = nexus.static.StaticFileOptions{
-        .index = "index.html",
-        .cache_control = "public, max-age=86400", // 24 hours
-        .enable_etag = true,
-        .enable_range = true,
-        .dot_files = false, // Don't serve hidden files
-    };
-
-    try server.use(struct {
-        const options = static_options;
-
+    // Serve static files from ./public directory. The handler resolves the
+    // request path against ./public, guards against directory traversal, sets
+    // the MIME type from the file extension, and streams the file contents.
+    try server.route("GET", "/", struct {
         fn handler(req: *nexus.http.Request, res: *nexus.http.Response) !void {
-            // Build path from URL
-            var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-            const path = try std.fmt.bufPrint(&path_buf, "public{s}", .{req.path});
+            // Directory traversal protection.
+            if (std.mem.indexOf(u8, req.path, "..")) |_| {
+                res.status_code = .Forbidden;
+                try res.text("Invalid path");
+                return;
+            }
 
-            try nexus.static.serveFile(req.allocator, path, req, res, options);
+            // Map "/" to the index file; otherwise strip the leading slash.
+            const rel = if (req.path.len <= 1) "index.html" else req.path[1..];
+
+            var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const path = try std.fmt.bufPrint(&path_buf, "public/{s}", .{rel});
+
+            const content = nexus.fs.readFile(res.allocator, res.io, path) catch {
+                res.status_code = .NotFound;
+                try res.text("File not found");
+                return;
+            };
+            defer res.allocator.free(content);
+
+            _ = try res.setHeader("Content-Type", nexus.static.getMimeType(path));
+            _ = try res.setHeader("Cache-Control", "public, max-age=86400");
+            try res.send(content);
         }
     }.handler);
 
+    const io = server.tcp_server.io.io();
+
     // Create example public directory if it doesn't exist
-    std.fs.cwd().makeDir("public") catch {};
+    std.Io.Dir.cwd().createDirPath(io, "public") catch {};
 
     // Create sample index.html if it doesn't exist
-    if (!try nexus.fs.exists("public/index.html")) {
-        try nexus.fs.writeFile(allocator, "public/index.html",
+    if (!nexus.fs.exists(io, "public/index.html")) {
+        try nexus.fs.writeFile(allocator, io, "public/index.html",
             \\<!DOCTYPE html>
             \\<html>
             \\<head>
@@ -128,13 +139,11 @@ pub fn main() !void {
             \\        <p>Hidden files (starting with .) are not served by default.</p>
             \\    </div>
             \\
-            \\    <h2>Performance</h2>
-            \\    <p>Nexus is <strong>10x faster</strong> than Node.js thanks to:</p>
+            \\    <h2>Design</h2>
             \\    <ul>
-            \\        <li>Native Zig performance (no JIT warmup)</li>
+            \\        <li>Native Zig, no JIT warmup</li>
             \\        <li>Zero-copy I/O where possible</li>
-            \\        <li>Efficient memory management</li>
-            \\        <li>Optimized HTTP parser</li>
+            \\        <li>Explicit memory management</li>
             \\    </ul>
             \\
             \\    <p><em>Check the Network tab in DevTools to see ETag and caching in action!</em></p>

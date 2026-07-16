@@ -1,0 +1,89 @@
+name: Bug report
+description: Report a build failure, runtime crash, or incorrect behavior in Nexus.
+title: "[bug] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Nexus is experimental, pre-1.0 software that tracks a single pinned Zig
+        dev toolchain. Before filing, confirm your `zig version` matches
+        `minimum_zig_version` in
+        [`build.zig.zon`](https://github.com/ghostkellz/nexus/blob/main/build.zig.zon)
+        — most build failures are toolchain mismatches. Please also check the
+        [capability status](https://github.com/ghostkellz/nexus#capability-status);
+        many subsystems are known-incomplete and tracked already.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What is broken?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. zig build ...
+        2. nexus run ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Paste the exact compiler or runtime error, including file:line.
+    validations:
+      required: true
+  - type: input
+    id: zig-version
+    attributes:
+      label: Zig version
+      description: Output of `zig version`.
+      placeholder: 0.17.0-dev.1397+4331ba0fb
+    validations:
+      required: true
+  - type: input
+    id: nexus-version
+    attributes:
+      label: Nexus version / commit
+      placeholder: 0.1.2 (or a commit SHA)
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS / distribution
+      placeholder: Arch Linux / Ubuntu 24.04 / macOS 14
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - build / toolchain
+        - CLI (run / dev / serve)
+        - http / http2
+        - websocket / net
+        - wasm / wasi / policy
+        - db (postgres / redis)
+        - tls / acme
+        - docs
+        - other
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: Relevant build output, stack traces, or a minimal reproducing source file.

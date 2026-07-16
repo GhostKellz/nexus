@@ -129,27 +129,53 @@ pub const Preopen = struct {
     rights: Rights,
 };
 
+/// An open file descriptor together with its current logical offset. The Zig
+/// 0.17 `Io.File` API is positional and stateless, so the WASI layer owns the
+/// seek cursor instead of relying on a kernel-tracked file position.
+const OpenFile = struct {
+    file: std.Io.File,
+    offset: u64 = 0,
+    /// Rights granted to this descriptor at open time (a subset of the owning
+    /// preopen's rights). Persisted so `fd_fdstat_get` reports the real
+    /// capability set instead of claiming all rights, and so future operations
+    /// can reject escalation.
+    rights: Rights = .{},
+};
+
+/// Convert an `Io.Timestamp` (or an optional one, as `Stat.atime` is) to the
+/// unsigned nanosecond count WASI's `filestat` expects. Missing or negative
+/// timestamps clamp to 0.
+fn timestampNanos(ts: anytype) u64 {
+    const value = switch (@typeInfo(@TypeOf(ts))) {
+        .optional => if (ts) |t| t.nanoseconds else return 0,
+        else => ts.nanoseconds,
+    };
+    return @intCast(@max(value, 0));
+}
+
 /// WASI context
 pub const WasiContext = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     preopens: std.ArrayList(Preopen),
     args: []const []const u8,
     env: std.StringHashMap([]const u8),
-    stdin: std.fs.File,
-    stdout: std.fs.File,
-    stderr: std.fs.File,
-    file_table: std.AutoHashMap(Fd, std.fs.File),
+    stdin: std.Io.File,
+    stdout: std.Io.File,
+    stderr: std.Io.File,
+    file_table: std.AutoHashMap(Fd, OpenFile),
 
-    pub fn init(allocator: std.mem.Allocator, args: []const []const u8) !WasiContext {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !WasiContext {
         return WasiContext{
             .allocator = allocator,
-            .preopens = std.ArrayList(Preopen).init(allocator),
+            .io = io,
+            .preopens = .empty,
             .args = args,
             .env = std.StringHashMap([]const u8).init(allocator),
-            .stdin = std.io.getStdIn(),
-            .stdout = std.io.getStdOut(),
-            .stderr = std.io.getStdErr(),
-            .file_table = std.AutoHashMap(Fd, std.fs.File).init(allocator),
+            .stdin = std.Io.File.stdin(),
+            .stdout = std.Io.File.stdout(),
+            .stderr = std.Io.File.stderr(),
+            .file_table = std.AutoHashMap(Fd, OpenFile).init(allocator),
         };
     }
 
@@ -157,7 +183,7 @@ pub const WasiContext = struct {
         for (self.preopens.items) |*preopen| {
             self.allocator.free(preopen.path);
         }
-        self.preopens.deinit();
+        self.preopens.deinit(self.allocator);
 
         var env_it = self.env.iterator();
         while (env_it.next()) |entry| {
@@ -168,8 +194,8 @@ pub const WasiContext = struct {
 
         // Close all open file descriptors
         var file_it = self.file_table.valueIterator();
-        while (file_it.next()) |file| {
-            file.close();
+        while (file_it.next()) |entry| {
+            entry.file.close(self.io);
         }
         self.file_table.deinit();
     }
@@ -178,7 +204,7 @@ pub const WasiContext = struct {
         const fd: Fd = @intCast(self.preopens.items.len + 3); // 0, 1, 2 are stdio
         const path_duped = try self.allocator.dupe(u8, path);
 
-        try self.preopens.append(Preopen{
+        try self.preopens.append(self.allocator, Preopen{
             .fd = fd,
             .path = path_duped,
             .rights = rights,
@@ -197,11 +223,65 @@ pub const WasiContext = struct {
     }
 };
 
+/// Maximum path components accepted while confining a WASI path. Real sandbox
+/// trees are far shallower; a deeper path fails closed rather than doing
+/// unbounded work for a hostile guest.
+const max_wasi_path_components = 256;
+
+const WasiPathError = error{ PathTraversal, PathTooLong };
+
+/// Confine an untrusted guest `rel` path within the preopened directory
+/// `base_dir`, writing the resolved absolute path to `out`. WASI paths are
+/// interpreted relative to the preopen, so components are normalized lexically:
+/// "." is dropped, ".." pops one component, and a ".." that would escape above
+/// `base_dir` fails closed with `PathTraversal`. Leading slashes are treated as
+/// separators (they cannot break out of the sandbox), and confinement is on a
+/// component boundary — a prefix sibling like `/sandbox-evil` can never be
+/// reached from base `/sandbox`. This replaces the old
+/// `startsWith(resolved, preopen.path)` test, which accepted prefix siblings,
+/// and the unchecked ops that touched the process CWD directly.
+///
+/// Purely lexical: symlink escapes are a separate concern handled at open time
+/// (realpath) once the WASI file I/O is reworked onto directory handles.
+fn confineWasiPath(base_dir: []const u8, rel: []const u8, out: []u8) WasiPathError![]const u8 {
+    var comps: [max_wasi_path_components][]const u8 = undefined;
+    var depth: usize = 0;
+    var it = std.mem.tokenizeScalar(u8, rel, '/');
+    while (it.next()) |c| {
+        if (std.mem.eql(u8, c, ".")) continue;
+        if (std.mem.eql(u8, c, "..")) {
+            if (depth == 0) return error.PathTraversal;
+            depth -= 1;
+            continue;
+        }
+        if (depth >= max_wasi_path_components) return error.PathTooLong;
+        comps[depth] = c;
+        depth += 1;
+    }
+
+    if (base_dir.len > out.len) return error.PathTooLong;
+    @memcpy(out[0..base_dir.len], base_dir);
+    var len = base_dir.len;
+    if (len > 0 and out[len - 1] == '/') len -= 1; // avoid a doubled separator
+    for (comps[0..depth]) |c| {
+        if (len + 1 + c.len > out.len) return error.PathTooLong;
+        out[len] = '/';
+        len += 1;
+        @memcpy(out[len..][0..c.len], c);
+        len += c.len;
+    }
+    return out[0..len];
+}
+
 /// WASI host functions
 pub const WasiHost = struct {
     context: *WasiContext,
     memory: *engine.Memory,
     allocator: std.mem.Allocator,
+    /// Exit code recorded by a guest `proc_exit`. The host reads this after the
+    /// guest unwinds via `error.ProcExit` instead of the guest being able to
+    /// terminate the whole runtime process.
+    exit_code: ?u32 = null,
 
     pub fn init(allocator: std.mem.Allocator, context: *WasiContext, memory: *engine.Memory) WasiHost {
         return WasiHost{
@@ -209,6 +289,54 @@ pub const WasiHost = struct {
             .memory = memory,
             .allocator = allocator,
         };
+    }
+
+    /// Result of resolving an untrusted guest path against a preopen: either the
+    /// confined absolute path (owned by the caller — free it) plus the rights the
+    /// preopen delegated, or a WASI errno describing why the request was denied.
+    const ResolvedPath = union(enum) {
+        ok: struct { path: []u8, rights: Rights },
+        deny: Errno,
+    };
+
+    /// Resolve the untrusted guest path in `[path_ptr, path_ptr+path_len)` against
+    /// the preopen named by `dirfd`, confining it within that preopen's directory.
+    /// This is the single choke point every filesystem path operation flows
+    /// through, replacing the old per-op code that resolved against the process
+    /// CWD and only did a `startsWith` prefix test (which accepted prefix
+    /// siblings). Reading memory can fail (`OutOfBounds`); every other failure is
+    /// surfaced as a `deny` errno so callers uniformly translate it to the guest.
+    fn resolvePreopenPath(self: *WasiHost, dirfd: Fd, path_ptr: u32, path_len: u32) !ResolvedPath {
+        const rel = try self.memory.read(path_ptr, path_len);
+        // An embedded NUL means the guest is trying to smuggle a shorter path
+        // past a length-based check on the host side; reject it outright.
+        if (std.mem.indexOfScalar(u8, rel, 0) != null) return .{ .deny = .INVAL };
+
+        const preopen = for (self.context.preopens.items) |p| {
+            if (p.fd == dirfd) break p;
+        } else return .{ .deny = .BADF };
+
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const confined = confineWasiPath(preopen.path, rel, &buf) catch return .{ .deny = .PERM };
+
+        const owned = try self.allocator.dupe(u8, confined);
+        return .{ .ok = .{ .path = owned, .rights = preopen.rights } };
+    }
+
+    /// Allocate the lowest free descriptor at or above 3, skipping any number
+    /// already claimed by a preopen or an open file. The old scheme
+    /// (`file_table.count() + 3`) aliased the first opened file onto preopen
+    /// fd 3 and reused numbers after a close, letting a guest confuse one
+    /// capability for another.
+    fn allocFd(self: *WasiHost) Fd {
+        var candidate: Fd = 3;
+        outer: while (true) : (candidate += 1) {
+            if (self.context.file_table.contains(candidate)) continue;
+            for (self.context.preopens.items) |p| {
+                if (p.fd == candidate) continue :outer;
+            }
+            return candidate;
+        }
     }
 
     /// WASI: args_sizes_get
@@ -280,8 +408,8 @@ pub const WasiHost = struct {
             const buf_len = try self.memory.readInt(u32, iov_offset + 4);
 
             const data = try self.memory.read(buf_ptr, buf_len);
-            const written = file.write(data) catch return .IO;
-            total_written += @intCast(written);
+            file.writeStreamingAll(self.context.io, data) catch return .IO;
+            total_written += @intCast(data.len);
         }
 
         try self.memory.writeInt(u32, nwritten_ptr, total_written);
@@ -307,7 +435,7 @@ pub const WasiHost = struct {
             var buffer = try self.allocator.alloc(u8, buf_len);
             defer self.allocator.free(buffer);
 
-            const read_count = file.read(buffer) catch return .IO;
+            const read_count = file.readStreaming(self.context.io, &.{buffer}) catch return .IO;
             try self.memory.write(buf_ptr, buffer[0..read_count]);
 
             total_read += @intCast(read_count);
@@ -319,17 +447,24 @@ pub const WasiHost = struct {
     }
 
     /// WASI: proc_exit
+    ///
+    /// A sandboxed guest must not be able to terminate the host runtime. The
+    /// previous implementation called `std.process.exit`, which killed the whole
+    /// process (and every other in-flight instance) on a single guest's request.
+    /// Instead, record the requested code and unwind the guest via
+    /// `error.ProcExit`; the embedder reads `exit_code` to learn the guest's
+    /// status without a process-global side effect.
     pub fn procExit(self: *WasiHost, exit_code: u32) !Errno {
-        _ = self;
-        std.process.exit(@intCast(exit_code));
+        self.exit_code = exit_code;
+        return error.ProcExit;
     }
 
     /// WASI: fd_close
     pub fn fdClose(self: *WasiHost, fd: Fd) !Errno {
         if (fd < 3) return .BADF; // Don't close stdio
 
-        if (self.context.file_table.get(fd)) |file| {
-            file.close();
+        if (self.context.file_table.get(fd)) |entry| {
+            entry.file.close(self.context.io);
             _ = self.context.file_table.remove(fd);
             return .SUCCESS;
         }
@@ -339,33 +474,34 @@ pub const WasiHost = struct {
 
     /// WASI: fd_seek
     pub fn fdSeek(self: *WasiHost, fd: Fd, offset: i64, whence: u8, newoffset_ptr: u32) !Errno {
-        const file = self.context.file_table.get(fd) orelse return .BADF;
+        const entry = self.context.file_table.getPtr(fd) orelse return .BADF;
 
-        // Translate WASI whence to std.io.SeekFrom
+        // `Io.File` is positional and stateless, so the cursor lives in
+        // `OpenFile.offset`. Resolve WASI whence to an absolute offset.
         // whence: 0 = SET (start), 1 = CUR (current), 2 = END (end)
         const new_offset: u64 = switch (whence) {
             0 => blk: {
                 // SET: seek from beginning
-                break :blk file.seekTo(@intCast(offset)) catch return .IO;
+                if (offset < 0) return .INVAL;
+                break :blk @intCast(offset);
             },
             1 => blk: {
                 // CUR: seek from current position
-                const current = file.getPos() catch return .IO;
-                const target = @as(i64, @intCast(current)) + offset;
+                const target = @as(i64, @intCast(entry.offset)) + offset;
                 if (target < 0) return .INVAL;
-                break :blk file.seekTo(@intCast(target)) catch return .IO;
+                break :blk @intCast(target);
             },
             2 => blk: {
                 // END: seek from end
-                const stat = file.stat() catch return .IO;
-                const file_size = @as(i64, @intCast(stat.size));
-                const target = file_size + offset;
+                const stat = entry.file.stat(self.context.io) catch return .IO;
+                const target = @as(i64, @intCast(stat.size)) + offset;
                 if (target < 0) return .INVAL;
-                break :blk file.seekTo(@intCast(target)) catch return .IO;
+                break :blk @intCast(target);
             },
             else => return .INVAL,
         };
 
+        entry.offset = new_offset;
         try self.memory.writeInt(u64, newoffset_ptr, new_offset);
 
         return .SUCCESS;
@@ -388,40 +524,48 @@ pub const WasiHost = struct {
         _ = fs_rights_inheriting;
         _ = fdflags;
 
-        const path_bytes = try self.memory.read(path_ptr, path_len);
-        const path = std.fs.path.resolve(self.allocator, &.{path_bytes}) catch return .NOENT;
+        const resolved = switch (try self.resolvePreopenPath(dirfd, path_ptr, path_len)) {
+            .deny => |errno| return errno,
+            .ok => |ok| ok,
+        };
+        const path = resolved.path;
         defer self.allocator.free(path);
 
-        // Check preopen permissions
-        var allowed = false;
-        for (self.context.preopens.items) |preopen| {
-            if (preopen.fd == dirfd and std.mem.startsWith(u8, path, preopen.path)) {
-                allowed = true;
-                break;
-            }
-        }
-        if (!allowed) return .PERM;
+        const granted: u64 = @bitCast(resolved.rights);
 
-        // Determine open mode
+        // The directory handle must itself carry path_open, and the requested
+        // base rights must be a subset of what the preopen delegated — a guest
+        // cannot mint a capability the host never granted.
+        if (!resolved.rights.path_open) return .PERM;
+        if ((fs_rights_base & ~granted) != 0) return .PERM;
+
+        const io = self.context.io;
+        const cwd = std.Io.Dir.cwd();
+
+        // Determine open mode from the (already validated) requested rights.
         const read = (fs_rights_base & 0x02) != 0; // fd_read
         const write = (fs_rights_base & 0x40) != 0; // fd_write
         const create = (oflags & 0x01) != 0; // O_CREAT
         const truncate = (oflags & 0x04) != 0; // O_TRUNC
 
-        const flags = std.fs.File.OpenFlags{
-            .mode = if (read and write) .read_write else if (write) .write_only else .read_only,
-        };
-
-        const file = if (create)
-            std.fs.cwd().createFile(path, flags) catch return .IO
-        else if (truncate)
-            std.fs.cwd().createFile(path, flags) catch return .IO
+        const file = if (create or truncate)
+            cwd.createFile(io, path, .{
+                .read = read,
+                .truncate = truncate,
+            }) catch return .IO
         else
-            std.fs.cwd().openFile(path, flags) catch return .NOENT;
+            cwd.openFile(io, path, .{
+                .mode = if (read and write) .read_write else if (write) .write_only else .read_only,
+            }) catch return .NOENT;
 
-        // Allocate new FD
-        const new_fd = @as(Fd, @intCast(self.context.file_table.count() + 3));
-        try self.context.file_table.put(new_fd, file);
+        // Persist the intersection of requested and granted rights so the new
+        // descriptor can never exceed what the guest asked for or the preopen
+        // allowed, and so fd_fdstat_get reports its true capability set.
+        const new_fd = self.allocFd();
+        try self.context.file_table.put(new_fd, .{
+            .file = file,
+            .rights = @bitCast(fs_rights_base & granted),
+        });
         try self.memory.writeInt(u32, fd_ptr, new_fd);
 
         return .SUCCESS;
@@ -430,10 +574,15 @@ pub const WasiHost = struct {
     /// WASI: path_filestat_get
     pub fn pathFilestatGet(self: *WasiHost, fd: Fd, flags: u32, path_ptr: u32, path_len: u32, buf_ptr: u32) !Errno {
         _ = flags;
-        _ = fd;
 
-        const path_bytes = try self.memory.read(path_ptr, path_len);
-        const stat = std.fs.cwd().statFile(path_bytes) catch return .NOENT;
+        const resolved = switch (try self.resolvePreopenPath(fd, path_ptr, path_len)) {
+            .deny => |errno| return errno,
+            .ok => |ok| ok,
+        };
+        defer self.allocator.free(resolved.path);
+        if (!resolved.rights.path_filestat_get) return .PERM;
+
+        const stat = std.Io.Dir.cwd().statFile(self.context.io, resolved.path, .{}) catch return .NOENT;
 
         // Write filestat structure (64 bytes total)
         try self.memory.writeInt(u64, buf_ptr + 0, 0); // dev
@@ -441,39 +590,51 @@ pub const WasiHost = struct {
         try self.memory.writeInt(u8, buf_ptr + 16, @intFromEnum(stat.kind)); // filetype
         try self.memory.writeInt(u64, buf_ptr + 24, 1); // nlink
         try self.memory.writeInt(u64, buf_ptr + 32, stat.size); // size
-        try self.memory.writeInt(u64, buf_ptr + 40, @intCast(stat.atime)); // atim
-        try self.memory.writeInt(u64, buf_ptr + 48, @intCast(stat.mtime)); // mtim
-        try self.memory.writeInt(u64, buf_ptr + 56, @intCast(stat.ctime)); // ctim
+        try self.memory.writeInt(u64, buf_ptr + 40, timestampNanos(stat.atime)); // atim
+        try self.memory.writeInt(u64, buf_ptr + 48, timestampNanos(stat.mtime)); // mtim
+        try self.memory.writeInt(u64, buf_ptr + 56, timestampNanos(stat.ctime)); // ctim
 
         return .SUCCESS;
     }
 
     /// WASI: path_create_directory
     pub fn pathCreateDirectory(self: *WasiHost, fd: Fd, path_ptr: u32, path_len: u32) !Errno {
-        _ = fd;
+        const resolved = switch (try self.resolvePreopenPath(fd, path_ptr, path_len)) {
+            .deny => |errno| return errno,
+            .ok => |ok| ok,
+        };
+        defer self.allocator.free(resolved.path);
+        if (!resolved.rights.path_create_directory) return .PERM;
 
-        const path_bytes = try self.memory.read(path_ptr, path_len);
-        std.fs.cwd().makeDir(path_bytes) catch return .IO;
+        std.Io.Dir.cwd().createDir(self.context.io, resolved.path, .default_dir) catch return .IO;
 
         return .SUCCESS;
     }
 
     /// WASI: path_remove_directory
     pub fn pathRemoveDirectory(self: *WasiHost, fd: Fd, path_ptr: u32, path_len: u32) !Errno {
-        _ = fd;
+        const resolved = switch (try self.resolvePreopenPath(fd, path_ptr, path_len)) {
+            .deny => |errno| return errno,
+            .ok => |ok| ok,
+        };
+        defer self.allocator.free(resolved.path);
+        if (!resolved.rights.path_remove_directory) return .PERM;
 
-        const path_bytes = try self.memory.read(path_ptr, path_len);
-        std.fs.cwd().deleteDir(path_bytes) catch return .IO;
+        std.Io.Dir.cwd().deleteDir(self.context.io, resolved.path) catch return .IO;
 
         return .SUCCESS;
     }
 
     /// WASI: path_unlink_file
     pub fn pathUnlinkFile(self: *WasiHost, fd: Fd, path_ptr: u32, path_len: u32) !Errno {
-        _ = fd;
+        const resolved = switch (try self.resolvePreopenPath(fd, path_ptr, path_len)) {
+            .deny => |errno| return errno,
+            .ok => |ok| ok,
+        };
+        defer self.allocator.free(resolved.path);
+        if (!resolved.rights.path_unlink_file) return .PERM;
 
-        const path_bytes = try self.memory.read(path_ptr, path_len);
-        std.fs.cwd().deleteFile(path_bytes) catch return .IO;
+        std.Io.Dir.cwd().deleteFile(self.context.io, resolved.path) catch return .IO;
 
         return .SUCCESS;
     }
@@ -509,7 +670,8 @@ pub const WasiHost = struct {
         _ = precision;
 
         const timestamp = switch (clock_id) {
-            0, 1 => std.time.nanoTimestamp(), // realtime, monotonic
+            0 => std.Io.Clock.real.now(self.context.io).nanoseconds, // realtime
+            1 => std.Io.Clock.awake.now(self.context.io).nanoseconds, // monotonic
             else => return .INVAL,
         };
 
@@ -522,7 +684,7 @@ pub const WasiHost = struct {
         const buffer = try self.allocator.alloc(u8, buf_len);
         defer self.allocator.free(buffer);
 
-        std.crypto.random.bytes(buffer);
+        self.context.io.random(buffer);
         try self.memory.write(buf_ptr, buffer);
 
         return .SUCCESS;
@@ -562,7 +724,7 @@ pub const WasiHost = struct {
 
                     // If ABSTIME flag is set, convert absolute time to relative
                     if ((flags & SUBSCRIPTION_CLOCK_ABSTIME) != 0) {
-                        const now = @as(u64, @intCast(std.time.nanoTimestamp()));
+                        const now = @as(u64, @intCast(std.Io.Clock.real.now(self.context.io).nanoseconds));
                         if (timeout > now) {
                             effective_timeout = timeout - now;
                         } else {
@@ -602,12 +764,12 @@ pub const WasiHost = struct {
 
                     // Map WASI fd to host fd
                     const host_fd: std.posix.fd_t = switch (wasi_fd) {
-                        0 => std.io.getStdIn().handle,
-                        1 => std.io.getStdOut().handle,
-                        2 => std.io.getStdErr().handle,
+                        0 => std.Io.File.stdin().handle,
+                        1 => std.Io.File.stdout().handle,
+                        2 => std.Io.File.stderr().handle,
                         else => blk: {
-                            if (self.context.file_table.get(@intCast(wasi_fd))) |file| {
-                                break :blk file.handle;
+                            if (self.context.file_table.get(@intCast(wasi_fd))) |entry| {
+                                break :blk entry.file.handle;
                             }
                             continue; // Skip invalid FDs
                         },
@@ -633,7 +795,7 @@ pub const WasiHost = struct {
 
             // Perform the poll
             if (poll_count > 0) {
-                const poll_result = std.posix.poll(poll_fds[0..poll_count], timeout_ms);
+                const poll_result = try std.posix.poll(poll_fds[0..poll_count], timeout_ms);
 
                 // Process poll results
                 for (0..poll_count) |pi| {
@@ -685,9 +847,17 @@ pub const WasiHost = struct {
                 }
             }
         } else if (min_timeout_ns) |timeout_ns| {
-            // Only clock subscriptions - just sleep and fire them
+            // Only clock subscriptions - wait via the pinned std.Io provider and
+            // fire them. Using the runtime's io (not legacy std.time.sleep) keeps
+            // the wait on the same scheduler the rest of the runtime cooperates
+            // with, so a clock-only poll_oneoff yields instead of parking the OS
+            // thread out from under the event loop.
             if (timeout_ns > 0) {
-                std.time.sleep(timeout_ns);
+                const timeout = std.Io.Timeout{ .duration = .{
+                    .raw = std.Io.Duration.fromNanoseconds(@intCast(timeout_ns)),
+                    .clock = .awake,
+                } };
+                timeout.sleep(self.context.io) catch {};
             }
 
             // Fire all clock events
@@ -717,15 +887,38 @@ pub const WasiHost = struct {
 
     /// WASI: fd_fdstat_get
     pub fn fdFdstatGet(self: *WasiHost, fd: Fd, buf_ptr: u32) !Errno {
-        const filetype: u8 = if (fd < 3) 2 else 4; // character_device or regular_file
+        // Report the descriptor's real capability set. Claiming all rights
+        // (the old `0xFFFFFFFF`) told guests they could perform operations the
+        // host would then reject — or, worse, masked a missing check.
+        var filetype: u8 = 4; // regular_file
+        var rights: Rights = .{};
+
+        if (fd < 3) {
+            filetype = 2; // character_device
+            rights = switch (fd) {
+                0 => .{ .fd_read = true },
+                else => .{ .fd_write = true },
+            };
+        } else if (self.context.file_table.get(fd)) |entry| {
+            rights = entry.rights;
+        } else {
+            // A preopened directory handle, if any matches.
+            for (self.context.preopens.items) |preopen| {
+                if (preopen.fd == fd) {
+                    filetype = 3; // directory
+                    rights = preopen.rights;
+                    break;
+                }
+            } else return .BADF;
+        }
+
         const flags: u16 = 0;
-        const rights_base: u64 = 0xFFFFFFFF; // all rights
-        const rights_inheriting: u64 = 0xFFFFFFFF;
+        const rights_bits: u64 = @bitCast(rights);
 
         try self.memory.writeInt(u8, buf_ptr, filetype);
         try self.memory.writeInt(u16, buf_ptr + 2, flags);
-        try self.memory.writeInt(u64, buf_ptr + 8, rights_base);
-        try self.memory.writeInt(u64, buf_ptr + 16, rights_inheriting);
+        try self.memory.writeInt(u64, buf_ptr + 8, rights_bits);
+        try self.memory.writeInt(u64, buf_ptr + 16, rights_bits);
 
         return .SUCCESS;
     }
@@ -748,60 +941,44 @@ pub const WasiHost = struct {
             return .BADF;
         };
 
-        const stat = file.stat() catch return .IO;
+        const stat = file.file.stat(self.context.io) catch return .IO;
 
         try self.memory.writeInt(u64, buf_ptr + 0, 0); // dev
         try self.memory.writeInt(u64, buf_ptr + 8, 0); // ino
         try self.memory.writeInt(u8, buf_ptr + 16, @intFromEnum(stat.kind)); // filetype
         try self.memory.writeInt(u64, buf_ptr + 24, 1); // nlink
         try self.memory.writeInt(u64, buf_ptr + 32, stat.size); // size
-        try self.memory.writeInt(u64, buf_ptr + 40, @intCast(stat.atime)); // atim
-        try self.memory.writeInt(u64, buf_ptr + 48, @intCast(stat.mtime)); // mtim
-        try self.memory.writeInt(u64, buf_ptr + 56, @intCast(stat.ctime)); // ctim
+        try self.memory.writeInt(u64, buf_ptr + 40, timestampNanos(stat.atime)); // atim
+        try self.memory.writeInt(u64, buf_ptr + 48, timestampNanos(stat.mtime)); // mtim
+        try self.memory.writeInt(u64, buf_ptr + 56, timestampNanos(stat.ctime)); // ctim
 
         return .SUCCESS;
     }
 
-    /// Register all WASI functions to a WASM instance
-    pub fn registerAll(_: *WasiHost, instance: *engine.Instance) !void {
-        // This would involve creating wrapper functions for each WASI call
-        // Each wrapper needs to extract parameters from WASM values and call the corresponding function
-
-        // Example wrapper for args_sizes_get
-        const argsSizesGetWrapper = struct {
-            fn call(params: []const engine.Value, allocator: std.mem.Allocator) ![]engine.Value {
-                _ = allocator;
-                _ = params;
-                // Implementation would extract params and call self.argsSizesGet()
-                return &[_]engine.Value{};
-            }
-        }.call;
-
-        const empty_params = [_]engine.ValueType{};
-        const errno_return = [_]engine.ValueType{.i32};
-
-        try instance.registerHostFunction("wasi_snapshot_preview1.args_sizes_get", &empty_params, &errno_return, argsSizesGetWrapper);
-
-        // Register remaining ~60 WASI functions following the same pattern
-        // Full implementation would create wrappers for:
-        // - args_get, environ_sizes_get, environ_get
-        // - fd_read, fd_write, fd_close, fd_seek, fd_tell
-        // - path_open, path_create_directory, path_remove_directory
-        // - path_unlink_file, path_rename, path_link, path_symlink
-        // - path_filestat_get, fd_filestat_get, fd_fdstat_get
-        // - fd_prestat_get, fd_prestat_dir_name
-        // - clock_time_get, clock_res_get
-        // - random_get, poll_oneoff
-        // - sock_recv, sock_send, sock_shutdown
-        // - sched_yield, proc_exit, proc_raise
+    /// Register all WASI functions to a WASM instance.
+    ///
+    /// Fail closed: the individual WASI preview1 syscalls above are fully
+    /// implemented, but wiring them onto a guest instance needs a wrapper per
+    /// function that marshals guest values in/out — and that marshalling only
+    /// works once the interpreter can actually invoke host functions from guest
+    /// code (call/call_indirect are themselves unsupported, see interpreter.zig).
+    /// The previous version registered a single no-op wrapper for
+    /// `args_sizes_get` that ignored its params and returned an empty result,
+    /// so a guest calling it would silently observe "0 args" — a false success.
+    /// Rather than register fake wrappers, refuse until the calling machinery
+    /// exists, so a caller cannot mistake a stubbed import table for a working
+    /// WASI environment.
+    pub fn registerAll(_: *WasiHost, _: *engine.Instance) !void {
+        return error.WasiRegistrationUnsupported;
     }
 };
 
 test "wasi context" {
     const allocator = std.testing.allocator;
 
+    const io = std.Io.Threaded.global_single_threaded.io();
     const args = [_][]const u8{ "prog", "arg1", "arg2" };
-    var context = try WasiContext.init(allocator, &args);
+    var context = try WasiContext.init(allocator, io, &args);
     defer context.deinit();
 
     try context.setEnv("PATH", "/usr/bin");
@@ -812,6 +989,307 @@ test "wasi context" {
         .path_open = true,
         .fd_seek = true,
     };
-    const fd = try context.addPreopen("/tmp", read_rights);
+    const fd = try context.addPreopen("/sandbox", read_rights);
     try std.testing.expectEqual(@as(Fd, 3), fd);
+}
+
+test "registerAll fails closed instead of wiring fake WASI imports" {
+    const allocator = std.testing.allocator;
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const args = [_][]const u8{"prog"};
+    var context = try WasiContext.init(allocator, io, &args);
+    defer context.deinit();
+
+    var memory = try engine.Memory.init(allocator, 1, 1);
+    defer memory.deinit();
+
+    var host = WasiHost.init(allocator, &context, &memory);
+
+    var instance = engine.Instance.init(allocator);
+    defer instance.deinit();
+
+    // The import table must not be populated with no-op wrappers that report
+    // false success; registration refuses until real call machinery exists.
+    try std.testing.expectError(error.WasiRegistrationUnsupported, host.registerAll(&instance));
+    try std.testing.expectEqual(@as(usize, 0), instance.functions.count());
+}
+
+test "proc_exit records the code and unwinds instead of killing the host" {
+    const allocator = std.testing.allocator;
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const args = [_][]const u8{"prog"};
+    var context = try WasiContext.init(allocator, io, &args);
+    defer context.deinit();
+
+    var memory = try engine.Memory.init(allocator, 1, 1);
+    defer memory.deinit();
+
+    var host = WasiHost.init(allocator, &context, &memory);
+
+    // Reaching this assertion at all proves proc_exit did not terminate the
+    // test process; the exit code is surfaced to the embedder instead.
+    try std.testing.expectError(error.ProcExit, host.procExit(42));
+    try std.testing.expectEqual(@as(?u32, 42), host.exit_code);
+}
+
+test "confineWasiPath confines relative paths within the preopen" {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings("/sandbox/a/b", try confineWasiPath("/sandbox", "a/b", &buf));
+    try std.testing.expectEqualStrings("/sandbox/a", try confineWasiPath("/sandbox", "a/./b/..", &buf));
+    try std.testing.expectEqualStrings("/sandbox", try confineWasiPath("/sandbox", ".", &buf));
+    try std.testing.expectEqualStrings("/sandbox/a", try confineWasiPath("/sandbox", "//a//", &buf));
+    // Parent traversal that stays inside the tree is fine.
+    try std.testing.expectEqualStrings("/sandbox/c", try confineWasiPath("/sandbox", "a/b/../../c", &buf));
+    // A trailing slash on the base must not produce a doubled separator.
+    try std.testing.expectEqualStrings("/sandbox/a", try confineWasiPath("/sandbox/", "a", &buf));
+    // A leading slash in the guest path is just a separator, never an escape.
+    try std.testing.expectEqualStrings("/sandbox/etc/passwd", try confineWasiPath("/sandbox", "/etc/passwd", &buf));
+}
+
+test "confineWasiPath rejects escapes and prefix siblings" {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    try std.testing.expectError(error.PathTraversal, confineWasiPath("/sandbox", "..", &buf));
+    try std.testing.expectError(error.PathTraversal, confineWasiPath("/sandbox", "a/../../etc/passwd", &buf));
+    // The old startsWith test accepted this sibling because "/sandbox-evil"
+    // has the "/sandbox" prefix; component confinement rejects it.
+    try std.testing.expectError(error.PathTraversal, confineWasiPath("/sandbox", "../sandbox-evil/key", &buf));
+}
+
+test "resolvePreopenPath confines paths and fails closed on bad input" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const args = [_][]const u8{};
+    var context = try WasiContext.init(allocator, io, &args);
+    defer context.deinit();
+
+    const dirfd = try context.addPreopen("/sandbox", .{ .path_open = true, .fd_read = true });
+
+    var memory = try engine.Memory.init(allocator, 1, null);
+    defer memory.deinit();
+
+    var host = WasiHost.init(allocator, &context, &memory);
+
+    // A legitimate relative path resolves under the preopen and carries its rights.
+    const good = "a/b";
+    try memory.write(0, good);
+    switch (try host.resolvePreopenPath(dirfd, 0, good.len)) {
+        .ok => |ok| {
+            defer allocator.free(ok.path);
+            try std.testing.expectEqualStrings("/sandbox/a/b", ok.path);
+            try std.testing.expect(ok.rights.path_open);
+        },
+        .deny => return error.TestUnexpectedDeny,
+    }
+
+    // Unknown dirfd → BADF.
+    switch (try host.resolvePreopenPath(99, 0, good.len)) {
+        .ok => |ok| {
+            allocator.free(ok.path);
+            return error.TestExpectedDeny;
+        },
+        .deny => |e| try std.testing.expectEqual(Errno.BADF, e),
+    }
+
+    // Traversal above the preopen → PERM.
+    const evil = "../../etc/passwd";
+    try memory.write(0, evil);
+    switch (try host.resolvePreopenPath(dirfd, 0, evil.len)) {
+        .ok => |ok| {
+            allocator.free(ok.path);
+            return error.TestExpectedDeny;
+        },
+        .deny => |e| try std.testing.expectEqual(Errno.PERM, e),
+    }
+
+    // Embedded NUL → INVAL (guest trying to truncate a host-side check).
+    const with_nul = "a\x00b";
+    try memory.write(0, with_nul);
+    switch (try host.resolvePreopenPath(dirfd, 0, with_nul.len)) {
+        .ok => |ok| {
+            allocator.free(ok.path);
+            return error.TestExpectedDeny;
+        },
+        .deny => |e| try std.testing.expectEqual(Errno.INVAL, e),
+    }
+}
+
+test "path_open denies rights escalation before touching the filesystem" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const args = [_][]const u8{};
+    var context = try WasiContext.init(allocator, io, &args);
+    defer context.deinit();
+
+    // Preopen grants only path_open + fd_read, never fd_write.
+    const dirfd = try context.addPreopen("/sandbox", .{ .path_open = true, .fd_read = true });
+
+    var memory = try engine.Memory.init(allocator, 1, null);
+    defer memory.deinit();
+
+    var host = WasiHost.init(allocator, &context, &memory);
+
+    const p = "file";
+    try memory.write(64, p);
+
+    // Requesting fd_write (0x40) — a right the preopen never delegated — is
+    // denied with PERM, and because the check precedes any filesystem access
+    // it holds even though /sandbox does not exist on the test host.
+    const escalated = try host.pathOpen(dirfd, 0, 64, p.len, 0, 0x40, 0, 0, 0);
+    try std.testing.expectEqual(Errno.PERM, escalated);
+    try std.testing.expectEqual(@as(u32, 0), host.context.file_table.count());
+}
+
+test "path_open requires the directory handle to carry path_open" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const args = [_][]const u8{};
+    var context = try WasiContext.init(allocator, io, &args);
+    defer context.deinit();
+
+    // A preopen without path_open cannot be used to open anything.
+    const dirfd = try context.addPreopen("/sandbox", .{ .fd_read = true });
+
+    var memory = try engine.Memory.init(allocator, 1, null);
+    defer memory.deinit();
+
+    var host = WasiHost.init(allocator, &context, &memory);
+
+    const p = "file";
+    try memory.write(64, p);
+    const denied = try host.pathOpen(dirfd, 0, 64, p.len, 0, 0x02, 0, 0, 0);
+    try std.testing.expectEqual(Errno.PERM, denied);
+}
+
+test "fd_fdstat_get reports the descriptor's real rights, not all rights" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const args = [_][]const u8{};
+    var context = try WasiContext.init(allocator, io, &args);
+    defer context.deinit();
+
+    const rights = Rights{ .path_open = true, .fd_read = true, .path_filestat_get = true };
+    const dirfd = try context.addPreopen("/sandbox", rights);
+
+    var memory = try engine.Memory.init(allocator, 1, null);
+    defer memory.deinit();
+
+    var host = WasiHost.init(allocator, &context, &memory);
+
+    try std.testing.expectEqual(Errno.SUCCESS, try host.fdFdstatGet(dirfd, 0));
+    const reported = try memory.readInt(u64, 8);
+    const expected: u64 = @bitCast(rights);
+    try std.testing.expectEqual(expected, reported);
+    // The old implementation reported 0xFFFFFFFF (every right) for every fd.
+    try std.testing.expect(reported != 0xFFFFFFFF);
+    // filetype directory (3) for a preopen handle.
+    try std.testing.expectEqual(@as(u8, 3), try memory.readInt(u8, 0));
+}
+
+test "Rights bitcast matches the WASI ABI bit layout" {
+    // The path_open mode detection in pathOpen masks fs_rights_base with these
+    // literals, so the packed-struct layout must line up with the ABI.
+    try std.testing.expectEqual(@as(u64, 0x02), @as(u64, @bitCast(Rights{ .fd_read = true })));
+    try std.testing.expectEqual(@as(u64, 0x40), @as(u64, @bitCast(Rights{ .fd_write = true })));
+    try std.testing.expectEqual(@as(u64, 0x2000), @as(u64, @bitCast(Rights{ .path_open = true })));
+}
+
+test "args_sizes_get and args_get serialize argv into guest memory" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const args = [_][]const u8{ "prog", "arg1", "ab" };
+    var context = try WasiContext.init(allocator, io, &args);
+    defer context.deinit();
+
+    var memory = try engine.Memory.init(allocator, 1, null);
+    defer memory.deinit();
+
+    var host = WasiHost.init(allocator, &context, &memory);
+
+    // args_sizes_get reports the count and the total NUL-terminated byte length.
+    try std.testing.expectEqual(Errno.SUCCESS, try host.argsSizesGet(0, 4));
+    try std.testing.expectEqual(@as(u32, 3), try memory.readInt(u32, 0));
+    // ("prog\0"=5) + ("arg1\0"=5) + ("ab\0"=3) = 13
+    try std.testing.expectEqual(@as(u32, 13), try memory.readInt(u32, 4));
+
+    // args_get lays out the pointer vector, then the packed NUL-terminated
+    // strings, with each pointer aimed at its string in the buffer.
+    try std.testing.expectEqual(Errno.SUCCESS, try host.argsGet(16, 64));
+    const p0 = try memory.readInt(u32, 16);
+    const p1 = try memory.readInt(u32, 20);
+    const p2 = try memory.readInt(u32, 24);
+    try std.testing.expectEqual(@as(u32, 64), p0);
+    try std.testing.expectEqual(@as(u32, 69), p1); // 64 + len("prog\0")
+    try std.testing.expectEqual(@as(u32, 74), p2); // 69 + len("arg1\0")
+    try std.testing.expectEqualStrings("prog", try memory.read(p0, 4));
+    try std.testing.expectEqual(@as(u8, 0), try memory.readInt(u8, p0 + 4));
+    try std.testing.expectEqualStrings("arg1", try memory.read(p1, 4));
+    try std.testing.expectEqual(@as(u8, 0), try memory.readInt(u8, p1 + 4));
+    try std.testing.expectEqualStrings("ab", try memory.read(p2, 2));
+    try std.testing.expectEqual(@as(u8, 0), try memory.readInt(u8, p2 + 2));
+}
+
+test "environ_sizes_get reports the entry count and packed byte length" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const args = [_][]const u8{};
+    var context = try WasiContext.init(allocator, io, &args);
+    defer context.deinit();
+
+    try context.setEnv("KEY", "VALUE");
+    try context.setEnv("A", "B");
+
+    var memory = try engine.Memory.init(allocator, 1, null);
+    defer memory.deinit();
+
+    var host = WasiHost.init(allocator, &context, &memory);
+
+    try std.testing.expectEqual(Errno.SUCCESS, try host.environSizesGet(0, 4));
+    try std.testing.expectEqual(@as(u32, 2), try memory.readInt(u32, 0));
+    // "KEY=VALUE\0" (10) + "A=B\0" (4) = 14. The reported size is a sum, so it
+    // is independent of hash-map iteration order.
+    try std.testing.expectEqual(@as(u32, 14), try memory.readInt(u32, 4));
+}
+
+test "allocFd never aliases a live descriptor and reuses only freed numbers" {
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const args = [_][]const u8{};
+    var context = try WasiContext.init(allocator, io, &args);
+    defer context.deinit();
+
+    // Two preopens occupy fds 3 and 4.
+    try std.testing.expectEqual(@as(Fd, 3), try context.addPreopen("/a", .{}));
+    try std.testing.expectEqual(@as(Fd, 4), try context.addPreopen("/b", .{}));
+
+    var memory = try engine.Memory.init(allocator, 1, null);
+    defer memory.deinit();
+
+    var host = WasiHost.init(allocator, &context, &memory);
+
+    // The lowest free fd skips both preopens.
+    try std.testing.expectEqual(@as(Fd, 5), host.allocFd());
+
+    // Placeholder open files occupy 5, 6, 7 so the next allocation must move
+    // past every live descriptor. allocFd only tests membership and never
+    // dereferences the entry; stdin is an inert stand-in, removed before deinit
+    // so it is never actually closed.
+    const placeholder = OpenFile{ .file = std.Io.File.stdin() };
+    try context.file_table.put(5, placeholder);
+    try context.file_table.put(6, placeholder);
+    try context.file_table.put(7, placeholder);
+    try std.testing.expectEqual(@as(Fd, 8), host.allocFd());
+
+    // Closing fd 6 frees that number. Reuse of a fully-closed descriptor is the
+    // correct POSIX behavior — the invariant is "never aliases a LIVE fd", not
+    // "monotonic, never-reuse" — so allocFd hands 6 back only once it is no
+    // longer live.
+    _ = context.file_table.remove(6);
+    try std.testing.expectEqual(@as(Fd, 6), host.allocFd());
+
+    // Drop the manual entries so the context deinit does not close the inert
+    // stdin placeholder.
+    _ = context.file_table.remove(5);
+    _ = context.file_table.remove(7);
 }
